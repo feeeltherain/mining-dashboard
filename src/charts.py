@@ -280,7 +280,7 @@ def unit_heatmap(df: pd.DataFrame, value_col: str, title: str) -> go.Figure:
         return _empty_figure(title, height=420)
     frame = df.copy()
     frame["date_label"] = pd.to_datetime(frame["date"], errors="coerce").dt.strftime("%d %b")
-    pivot = frame.pivot_table(index="equipment_id", columns="date_label", values=value_col, aggfunc="mean")
+    pivot = frame.pivot_table(index="equipment_id", columns="date_label", values=value_col, aggfunc="mean", observed=False)
     if pivot.empty:
         return _empty_figure(title, height=420)
     scale = [[0.0, "#F6EFE2"], [0.5, "#D7BE97"], [1.0, TOKENS["mine"]]] if value_col.endswith("_pct") else "YlOrBr"
