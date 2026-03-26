@@ -1,752 +1,532 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
-from typing import Any, Dict, Iterable, List, Optional
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
+from src.io_excel import build_field_guide
 
-@dataclass
+
+METRIC_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "bcm_moved": {"label": "BCM moved", "kind": "compact", "direction": "up", "domain": "Mine"},
+    "ore_mined_t": {"label": "Ore mined (t)", "kind": "compact", "direction": "up", "domain": "Mine"},
+    "stripping_ratio": {"label": "Stripping ratio", "kind": "ratio", "direction": "neutral", "domain": "Mine"},
+    "diesel_l": {"label": "Diesel consumption", "kind": "liters", "direction": "neutral", "domain": "Mine"},
+    "feed_tonnes": {"label": "Feed tonnes", "kind": "compact", "direction": "up", "domain": "Plant"},
+    "throughput_tph": {"label": "Throughput", "kind": "rate", "direction": "up", "domain": "Plant"},
+    "recovery_pct": {"label": "Recovery", "kind": "pct", "direction": "up", "domain": "Plant"},
+    "metal_produced_t": {"label": "Metal produced", "kind": "compact", "direction": "up", "domain": "Plant"},
+    "availability_pct": {"label": "Availability", "kind": "pct", "direction": "up", "domain": "Fleet"},
+    "utilization_pct": {"label": "Utilization", "kind": "pct", "direction": "up", "domain": "Fleet"},
+    "feed_grade_pct": {"label": "Feed grade", "kind": "pct", "direction": "neutral", "domain": "Plant"},
+    "unplanned_downtime_h": {"label": "Unplanned downtime", "kind": "hours", "direction": "down", "domain": "Plant"},
+}
+
+AVAILABILITY_GROUPS = [
+    {"group_name": "Excavators", "equipment_subtypes": ["excavator"]},
+    {"group_name": "Trucks", "equipment_subtypes": ["truck_220t", "truck_100t", "truck_60t"]},
+    {"group_name": "Drills", "equipment_subtypes": ["drill"]},
+    {"group_name": "Ancillary", "equipment_subtypes": ["drill", "dozer", "grader"]},
+]
+
+NON_OVERLAP_GROUPS = {
+    "excavator": "Excavators",
+    "truck_220t": "Trucks",
+    "truck_100t": "Trucks",
+    "truck_60t": "Trucks",
+    "drill": "Drills",
+    "dozer": "Support Units",
+    "grader": "Support Units",
+}
+
+GROUP_ORDER = [group["group_name"] for group in AVAILABILITY_GROUPS]
+MINE_FILTER_GROUP_ORDER = ["Excavators", "Trucks", "Drills", "Support Units"]
+SNAPSHOT_MINE_METRICS = ["bcm_moved", "ore_mined_t", "stripping_ratio", "diesel_l"]
+SNAPSHOT_PLANT_METRICS = ["feed_tonnes", "throughput_tph", "recovery_pct", "metal_produced_t"]
+
+
+@dataclass(frozen=True)
 class FilterState:
-    site_id: str
     date_from: Optional[date]
     date_to: Optional[date]
-    shift: str = "All"
-    area_ids: Optional[List[str]] = None
-    equipment_ids: Optional[List[str]] = None
 
 
 def _safe_div(numerator: Any, denominator: Any) -> float:
-    if denominator is None:
-        return float("nan")
     try:
-        if float(denominator) <= 0:
+        if denominator is None or pd.isna(denominator) or float(denominator) <= 0:
             return float("nan")
-    except (TypeError, ValueError):
-        return float("nan")
-    try:
+        if numerator is None or pd.isna(numerator):
+            return float("nan")
         return float(numerator) / float(denominator)
     except (TypeError, ValueError):
         return float("nan")
 
 
-def _to_list(values: Optional[Iterable[str]]) -> List[str]:
-    if values is None:
-        return []
-    return [str(v) for v in values if pd.notna(v)]
+def _sum_column(df: pd.DataFrame, column: str) -> float:
+    if df.empty or column not in df.columns:
+        return float("nan")
+    value = df[column].sum(min_count=1)
+    return float(value) if pd.notna(value) else float("nan")
 
 
-def filter_fact_dataframe(df: pd.DataFrame, filters: FilterState) -> pd.DataFrame:
-    if df.empty:
+def _weighted_average(df: pd.DataFrame, value_col: str, weight_col: str) -> float:
+    if df.empty or value_col not in df.columns or weight_col not in df.columns:
+        return float("nan")
+    scoped = df[[value_col, weight_col]].dropna()
+    scoped = scoped[scoped[weight_col] > 0]
+    if scoped.empty:
+        return float("nan")
+    return float(np.average(scoped[value_col], weights=scoped[weight_col]))
+
+
+def _first_mode(series: pd.Series) -> Any:
+    cleaned = series.dropna()
+    if cleaned.empty:
+        return pd.NA
+    mode = cleaned.mode()
+    return mode.iloc[0] if not mode.empty else cleaned.iloc[0]
+
+
+def filter_date_range(df: pd.DataFrame, date_from: Optional[date], date_to: Optional[date]) -> pd.DataFrame:
+    if df.empty or "date" not in df.columns:
         return df.copy()
-
     out = df.copy()
-    if "site_id" in out.columns:
-        out = out[out["site_id"] == filters.site_id]
-
-    if "date" in out.columns and filters.date_from is not None:
-        out = out[out["date"] >= filters.date_from]
-    if "date" in out.columns and filters.date_to is not None:
-        out = out[out["date"] <= filters.date_to]
-
-    if "shift" in out.columns and filters.shift != "All":
-        out = out[out["shift"] == filters.shift]
-
-    area_ids = _to_list(filters.area_ids)
-    if "area_id" in out.columns and area_ids:
-        out = out[out["area_id"].isin(area_ids)]
-
-    equipment_ids = _to_list(filters.equipment_ids)
-    if "equipment_id" in out.columns and equipment_ids:
-        out = out[out["equipment_id"].isin(equipment_ids)]
-
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.date
+    if date_from is not None:
+        out = out[out["date"] >= date_from]
+    if date_to is not None:
+        out = out[out["date"] <= date_to]
     return out
 
 
-def filter_all_facts(sheets: Dict[str, pd.DataFrame], filters: FilterState) -> Dict[str, pd.DataFrame]:
-    filtered: Dict[str, pd.DataFrame] = {}
-    for name in ["fact_shift_excavator", "fact_shift_truck", "fact_shift_truck_route"]:
-        filtered[name] = filter_fact_dataframe(sheets.get(name, pd.DataFrame()), filters)
-    return filtered
+def prepare_site_data(sheets: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    metadata = sheets.get("metadata", pd.DataFrame()).copy()
+    daily_mine = sheets.get("daily_mine", pd.DataFrame()).copy()
+    daily_plant = sheets.get("daily_plant", pd.DataFrame()).copy()
+    daily_fleet = sheets.get("daily_fleet", pd.DataFrame()).copy()
+    lookups = sheets.get("lookups", pd.DataFrame()).copy()
 
+    for frame in [daily_mine, daily_plant, daily_fleet]:
+        if not frame.empty and "date" in frame.columns:
+            frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.date
 
-def _apply_target_validity_window(df: pd.DataFrame, as_of_date: Optional[date]) -> pd.DataFrame:
-    if df.empty or as_of_date is None:
-        return df
+    if not daily_fleet.empty:
+        daily_fleet["availability_group"] = daily_fleet["equipment_subtype"].map(NON_OVERLAP_GROUPS).fillna("Support Units")
+        daily_fleet["mine_filter_group"] = daily_fleet["availability_group"]
 
-    out = df.copy()
-    as_of_ts = pd.Timestamp(as_of_date)
-    if "effective_from" in out.columns:
-        effective_from = pd.to_datetime(out["effective_from"], errors="coerce")
-        cond_from = effective_from.isna() | (effective_from <= as_of_ts)
-    else:
-        cond_from = pd.Series(True, index=out.index)
-
-    if "effective_to" in out.columns:
-        effective_to = pd.to_datetime(out["effective_to"], errors="coerce")
-        cond_to = effective_to.isna() | (effective_to >= as_of_ts)
-    else:
-        cond_to = pd.Series(True, index=out.index)
-
-    matched = out[cond_from & cond_to]
-    if matched.empty:
-        return out
-    return matched
-
-
-def resolve_target(
-    targets: pd.DataFrame,
-    site_id: str,
-    equipment_class: str,
-    metric_name: str,
-    area_ids: Optional[List[str]] = None,
-    as_of_date: Optional[date] = None,
-) -> float:
-    if targets.empty:
-        return float("nan")
-
-    required = {"site_id", "equipment_class", "metric_name", "target"}
-    if not required.issubset(targets.columns):
-        return float("nan")
-
-    mask = (
-        (targets["site_id"] == site_id)
-        & (targets["equipment_class"] == equipment_class)
-        & (targets["metric_name"] == metric_name)
-    )
-    scope = targets.loc[mask].copy()
-
-    if scope.empty:
-        return float("nan")
-
-    scope = _apply_target_validity_window(scope, as_of_date)
-
-    selected_area_ids = _to_list(area_ids)
-
-    if "area_id" in scope.columns and selected_area_ids:
-        area_scope = scope[scope["area_id"].notna()]
-        area_match = area_scope[area_scope["area_id"].isin(selected_area_ids)]
-        if not area_match.empty:
-            return float(area_match["target"].mean())
-
-    if "area_id" in scope.columns:
-        site_scope = scope[scope["area_id"].isna()]
-        if not site_scope.empty:
-            return float(site_scope["target"].mean())
-
-    return float(scope["target"].mean())
-
-
-def _period_trend(values: pd.DataFrame, value_col: str) -> Dict[str, Any]:
-    if values.empty or value_col not in values.columns or "date" not in values.columns:
-        return {"delta": float("nan"), "label": "N/A"}
-
-    series = values.dropna(subset=["date", value_col]).sort_values("date")
-    if len(series) < 2:
-        return {"delta": float("nan"), "label": "N/A"}
-
-    n = len(series)
-    window = min(7, max(1, n // 2))
-    current = series[value_col].tail(window).mean()
-    previous_block = series[value_col].iloc[max(0, n - 2 * window): n - window]
-    if previous_block.empty:
-        delta = series[value_col].iloc[-1] - series[value_col].iloc[0]
-    else:
-        delta = current - previous_block.mean()
-
-    if pd.isna(delta):
-        label = "N/A"
-    elif delta > 0:
-        label = "Up"
-    elif delta < 0:
-        label = "Down"
-    else:
-        label = "Flat"
-
-    return {"delta": float(delta), "label": label}
-
-
-def _reference_date(exc_df: pd.DataFrame, trk_df: pd.DataFrame) -> Optional[date]:
-    candidates: List[date] = []
-    for df in [exc_df, trk_df]:
-        if not df.empty and "date" in df.columns:
-            max_date = df["date"].dropna().max()
-            if pd.notna(max_date):
-                candidates.append(max_date)
-    if not candidates:
-        return None
-    return max(candidates)
-
-
-def _agg_daily_excavator(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "date" not in df.columns:
-        return pd.DataFrame(columns=["date", "tonnes_loaded", "availability_pct", "tonnes_per_operating_hour"])
-
-    required = {"tonnes_loaded", "operating_h", "down_h"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame(columns=["date", "tonnes_loaded", "availability_pct", "tonnes_per_operating_hour"])
-
-    daily = df.groupby("date", as_index=False)[["tonnes_loaded", "operating_h", "down_h"]].sum(min_count=1)
-    daily["availability_pct"] = daily.apply(
-        lambda r: _safe_div(r["operating_h"], r["operating_h"] + r["down_h"]), axis=1
-    )
-    daily["tonnes_per_operating_hour"] = daily.apply(
-        lambda r: _safe_div(r["tonnes_loaded"], r["operating_h"]), axis=1
-    )
-    return daily
-
-
-def _agg_daily_truck(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "date" not in df.columns:
-        return pd.DataFrame(columns=["date", "tonnes_hauled", "availability_pct", "tonnes_per_operating_hour", "avg_payload_t", "avg_cycle_time_min", "avg_queue_time_min"])
-
-    required = {"tonnes_hauled", "operating_h", "down_h", "trips"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame(columns=["date", "tonnes_hauled", "availability_pct", "tonnes_per_operating_hour", "avg_payload_t", "avg_cycle_time_min", "avg_queue_time_min"])
-
-    agg_map: Dict[str, Any] = {
-        "tonnes_hauled": "sum",
-        "operating_h": "sum",
-        "down_h": "sum",
-        "trips": "sum",
-    }
-    for optional in ["cycle_time_min", "queue_time_min"]:
-        if optional in df.columns:
-            agg_map[optional] = "mean"
-
-    daily = df.groupby("date", as_index=False).agg(agg_map)
-    daily["availability_pct"] = daily.apply(
-        lambda r: _safe_div(r["operating_h"], r["operating_h"] + r["down_h"]), axis=1
-    )
-    daily["tonnes_per_operating_hour"] = daily.apply(
-        lambda r: _safe_div(r["tonnes_hauled"], r["operating_h"]), axis=1
-    )
-    daily["avg_payload_t"] = daily.apply(lambda r: _safe_div(r["tonnes_hauled"], r["trips"]), axis=1)
-
-    if "cycle_time_min" in daily.columns:
-        daily["avg_cycle_time_min"] = daily["cycle_time_min"]
-    else:
-        daily["avg_cycle_time_min"] = float("nan")
-
-    if "queue_time_min" in daily.columns:
-        daily["avg_queue_time_min"] = daily["queue_time_min"]
-    else:
-        daily["avg_queue_time_min"] = float("nan")
-
-    return daily
-
-
-def _metric_card(
-    name: str,
-    actual: float,
-    target: float,
-    trend: Dict[str, Any],
-    reason: str = "",
-) -> Dict[str, Any]:
-    if pd.isna(actual):
-        return {
-            "metric": name,
-            "actual": float("nan"),
-            "target": target,
-            "delta": float("nan"),
-            "trend_label": trend.get("label", "N/A"),
-            "trend_delta": trend.get("delta", float("nan")),
-            "status": "N/A",
-            "reason": reason,
-        }
-
-    delta = actual - target if not pd.isna(target) else float("nan")
     return {
-        "metric": name,
-        "actual": float(actual),
-        "target": target,
-        "delta": delta,
-        "trend_label": trend.get("label", "N/A"),
-        "trend_delta": trend.get("delta", float("nan")),
-        "status": "OK",
-        "reason": reason,
+        "metadata": metadata,
+        "daily_mine": daily_mine,
+        "daily_plant": daily_plant,
+        "daily_fleet": daily_fleet,
+        "lookups": lookups,
     }
 
 
-def compute_overview(
-    filtered_excavator: pd.DataFrame,
-    filtered_truck: pd.DataFrame,
-    targets: pd.DataFrame,
-    filters: FilterState,
-) -> Dict[str, Any]:
-    ref_date = _reference_date(filtered_excavator, filtered_truck)
+def _previous_period(date_from: Optional[date], date_to: Optional[date]) -> tuple[Optional[date], Optional[date], int]:
+    if date_from is None or date_to is None:
+        return None, None, 0
+    days = (date_to - date_from).days + 1
+    prev_end = date_from - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=days - 1)
+    return prev_start, prev_end, days
 
-    exc_daily = _agg_daily_excavator(filtered_excavator)
-    trk_daily = _agg_daily_truck(filtered_truck)
 
-    cards: List[Dict[str, Any]] = []
+def aggregate_mine_daily(mine_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["date", "bcm_moved", "waste_bcm", "ore_bcm", "ore_mined_t", "stripping_ratio"]
+    if mine_df.empty or "date" not in mine_df.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = mine_df.groupby("date", as_index=False)[[col for col in ["bcm_moved", "waste_bcm", "ore_bcm", "ore_mined_t"] if col in mine_df.columns]].sum(min_count=1)
+    for col in ["bcm_moved", "waste_bcm", "ore_bcm", "ore_mined_t"]:
+        if col not in grouped.columns:
+            grouped[col] = pd.NA
+    grouped["stripping_ratio"] = grouped.apply(lambda row: _safe_div(row["waste_bcm"], row["ore_bcm"]), axis=1)
+    return grouped[columns].sort_values("date")
 
-    # Excavator cards
-    exc_tonnes = (
-        filtered_excavator["tonnes_loaded"].sum(min_count=1)
-        if "tonnes_loaded" in filtered_excavator.columns
-        else float("nan")
+
+def aggregate_area_contribution(mine_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["area_name", "bcm_moved", "ore_mined_t", "waste_bcm", "ore_bcm", "stripping_ratio"]
+    if mine_df.empty or "area_name" not in mine_df.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = mine_df.groupby("area_name", as_index=False).agg(
+        bcm_moved=("bcm_moved", "sum"),
+        ore_mined_t=("ore_mined_t", "sum"),
+        waste_bcm=("waste_bcm", "sum"),
+        ore_bcm=("ore_bcm", "sum"),
     )
-    cards.append(
-        _metric_card(
-            "excavator_tonnes_loaded",
-            exc_tonnes,
-            float("nan"),
-            _period_trend(exc_daily.rename(columns={"tonnes_loaded": "value"}), "value"),
-            reason="Target not configured for tonnes_loaded in standard contract.",
+    grouped["stripping_ratio"] = grouped.apply(lambda row: _safe_div(row["waste_bcm"], row["ore_bcm"]), axis=1)
+    return grouped[columns].sort_values("bcm_moved", ascending=False)
+
+
+def aggregate_plant_daily(plant_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "date",
+        "feed_tonnes",
+        "feed_grade_pct",
+        "throughput_tph",
+        "recovery_pct",
+        "metal_produced_t",
+        "availability_pct",
+        "unplanned_downtime_h",
+    ]
+    if plant_df.empty or "date" not in plant_df.columns:
+        return pd.DataFrame(columns=columns)
+    rows: List[Dict[str, Any]] = []
+    for current_date, group in plant_df.groupby("date"):
+        rows.append(
+            {
+                "date": current_date,
+                "feed_tonnes": _sum_column(group, "feed_tonnes"),
+                "feed_grade_pct": _weighted_average(group, "feed_grade_pct", "feed_tonnes"),
+                "throughput_tph": group["throughput_tph"].mean() if "throughput_tph" in group.columns else float("nan"),
+                "recovery_pct": _weighted_average(group, "recovery_pct", "feed_tonnes"),
+                "metal_produced_t": _sum_column(group, "metal_produced_t"),
+                "availability_pct": group["availability_pct"].mean() if "availability_pct" in group.columns else float("nan"),
+                "unplanned_downtime_h": _sum_column(group, "unplanned_downtime_h"),
+            }
         )
+    return pd.DataFrame(rows, columns=columns).sort_values("date")
+
+
+def aggregate_availability_groups(fleet_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["date", "group_name", "availability_pct", "utilization_pct", "equipment_count"]
+    if fleet_df.empty or not {"date", "equipment_subtype"}.issubset(fleet_df.columns):
+        return pd.DataFrame(columns=columns)
+    rows: List[Dict[str, Any]] = []
+    for group in AVAILABILITY_GROUPS:
+        scoped = fleet_df[fleet_df["equipment_subtypes"].isin(group["equipment_subtypes"])].copy() if "equipment_subtypes" in fleet_df.columns else fleet_df[fleet_df["equipment_subtype"].isin(group["equipment_subtypes"])].copy()
+        if scoped.empty:
+            continue
+        daily = scoped.groupby("date", as_index=False).agg(
+            availability_pct=("availability_pct", "mean"),
+            utilization_pct=("utilization_pct", "mean"),
+            equipment_count=("equipment_id", pd.Series.nunique),
+        )
+        daily["group_name"] = group["group_name"]
+        rows.append(daily[columns])
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    out = pd.concat(rows, ignore_index=True)
+    out["group_name"] = pd.Categorical(out["group_name"], categories=GROUP_ORDER, ordered=True)
+    return out.sort_values(["group_name", "date"])
+
+
+def aggregate_diesel_groups(fleet_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["date", "group_name", "diesel_l"]
+    if fleet_df.empty or not {"date", "availability_group", "diesel_l"}.issubset(fleet_df.columns):
+        return pd.DataFrame(columns=columns)
+    return (
+        fleet_df.groupby(["date", "availability_group"], as_index=False)["diesel_l"]
+        .sum(min_count=1)
+        .rename(columns={"availability_group": "group_name"})
+        .sort_values(["date", "group_name"])
     )
 
-    exc_tph = exc_daily["tonnes_per_operating_hour"].mean() if not exc_daily.empty else float("nan")
-    cards.append(
-        _metric_card(
-            "excavator_tonnes_per_operating_hour",
-            exc_tph,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "excavator",
-                "tonnes_per_operating_hour",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(exc_daily.rename(columns={"tonnes_per_operating_hour": "value"}), "value"),
-            reason="Requires tonnes_loaded and operating_h.",
-        )
-    )
 
-    exc_avail = exc_daily["availability_pct"].mean() if not exc_daily.empty else float("nan")
-    cards.append(
-        _metric_card(
-            "excavator_availability_pct",
-            exc_avail,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "excavator",
-                "availability_pct",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(exc_daily.rename(columns={"availability_pct": "value"}), "value"),
-            reason="Requires operating_h and down_h.",
+def summarize_units(fleet_df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "equipment_id",
+        "equipment_class",
+        "equipment_subtype",
+        "model",
+        "area_name",
+        "availability_pct",
+        "utilization_pct",
+        "diesel_l",
+        "days_reported",
+    ]
+    if fleet_df.empty or "equipment_id" not in fleet_df.columns:
+        return pd.DataFrame(columns=columns)
+    rows: List[Dict[str, Any]] = []
+    for equipment_id, group in fleet_df.groupby("equipment_id"):
+        rows.append(
+            {
+                "equipment_id": equipment_id,
+                "equipment_class": _first_mode(group["equipment_class"]) if "equipment_class" in group.columns else pd.NA,
+                "equipment_subtype": _first_mode(group["equipment_subtype"]) if "equipment_subtype" in group.columns else pd.NA,
+                "model": _first_mode(group["model"]) if "model" in group.columns else pd.NA,
+                "area_name": _first_mode(group["area_name"]) if "area_name" in group.columns else pd.NA,
+                "availability_pct": group["availability_pct"].mean() if "availability_pct" in group.columns else float("nan"),
+                "utilization_pct": group["utilization_pct"].mean() if "utilization_pct" in group.columns else float("nan"),
+                "diesel_l": _sum_column(group, "diesel_l"),
+                "days_reported": int(group["date"].nunique()) if "date" in group.columns else 0,
+            }
         )
-    )
+    ranking = pd.DataFrame(rows, columns=columns)
+    return ranking.sort_values(["availability_pct", "utilization_pct", "diesel_l"], ascending=[True, True, False], na_position="last")
 
-    # Truck cards
-    trk_tonnes = (
-        filtered_truck["tonnes_hauled"].sum(min_count=1)
-        if "tonnes_hauled" in filtered_truck.columns
-        else float("nan")
-    )
-    cards.append(
-        _metric_card(
-            "truck_tonnes_hauled",
-            trk_tonnes,
-            float("nan"),
-            _period_trend(trk_daily.rename(columns={"tonnes_hauled": "value"}), "value"),
-            reason="Target not configured for tonnes_hauled in standard contract.",
-        )
-    )
 
-    trk_tph = trk_daily["tonnes_per_operating_hour"].mean() if not trk_daily.empty else float("nan")
-    cards.append(
-        _metric_card(
-            "truck_tonnes_per_operating_hour",
-            trk_tph,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "truck",
-                "tonnes_per_operating_hour",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(trk_daily.rename(columns={"tonnes_per_operating_hour": "value"}), "value"),
-            reason="Requires tonnes_hauled and operating_h.",
-        )
-    )
+def build_unit_heatmap_data(fleet_df: pd.DataFrame, metric_name: str, max_units: int = 15) -> pd.DataFrame:
+    columns = ["equipment_id", "date", metric_name]
+    if fleet_df.empty or metric_name not in fleet_df.columns:
+        return pd.DataFrame(columns=columns)
+    ranking = summarize_units(fleet_df)
+    if ranking.empty or metric_name not in ranking.columns:
+        return pd.DataFrame(columns=columns)
+    selected_ids = ranking.sort_values(metric_name, ascending=True, na_position="last")["equipment_id"].head(max_units).tolist()
+    heatmap_df = fleet_df[fleet_df["equipment_id"].isin(selected_ids)].copy()
+    heatmap_df["equipment_id"] = pd.Categorical(heatmap_df["equipment_id"], categories=selected_ids, ordered=True)
+    return heatmap_df[columns].sort_values(["equipment_id", "date"])
 
-    trk_avail = trk_daily["availability_pct"].mean() if not trk_daily.empty else float("nan")
-    cards.append(
-        _metric_card(
-            "truck_availability_pct",
-            trk_avail,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "truck",
-                "availability_pct",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(trk_daily.rename(columns={"availability_pct": "value"}), "value"),
-            reason="Requires operating_h and down_h.",
-        )
-    )
 
-    # Driver metrics from truck data
-    avg_payload = trk_daily["avg_payload_t"].mean() if "avg_payload_t" in trk_daily.columns else float("nan")
-    cards.append(
-        _metric_card(
-            "avg_payload_t",
-            avg_payload,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "truck",
-                "avg_payload_t",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(trk_daily.rename(columns={"avg_payload_t": "value"}), "value"),
-            reason="Requires tonnes_hauled and trips.",
-        )
-    )
+def build_unit_timeline(fleet_df: pd.DataFrame, equipment_id: str) -> pd.DataFrame:
+    columns = ["date", "equipment_id", "availability_pct", "utilization_pct", "diesel_l"]
+    if fleet_df.empty or "equipment_id" not in fleet_df.columns:
+        return pd.DataFrame(columns=columns)
+    scoped = fleet_df[fleet_df["equipment_id"] == equipment_id].copy()
+    for column in columns:
+        if column not in scoped.columns:
+            scoped[column] = pd.NA
+    return scoped[columns].sort_values("date")
 
-    avg_cycle = trk_daily["avg_cycle_time_min"].mean() if "avg_cycle_time_min" in trk_daily.columns else float("nan")
-    cards.append(
-        _metric_card(
-            "avg_cycle_time_min",
-            avg_cycle,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "truck",
-                "cycle_time_min",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(trk_daily.rename(columns={"avg_cycle_time_min": "value"}), "value"),
-            reason="Requires cycle_time_min column.",
-        )
-    )
 
-    avg_queue = trk_daily["avg_queue_time_min"].mean() if "avg_queue_time_min" in trk_daily.columns else float("nan")
-    cards.append(
-        _metric_card(
-            "avg_queue_time_min",
-            avg_queue,
-            resolve_target(
-                targets,
-                filters.site_id,
-                "truck",
-                "queue_time_min",
-                filters.area_ids,
-                ref_date,
-            ),
-            _period_trend(trk_daily.rename(columns={"avg_queue_time_min": "value"}), "value"),
-            reason="Requires queue_time_min column.",
-        )
+def build_daily_operating_table(plant_df: pd.DataFrame) -> pd.DataFrame:
+    columns = ["date", "feed_tonnes", "feed_grade_pct", "throughput_tph", "recovery_pct", "metal_produced_t", "availability_pct", "unplanned_downtime_h"]
+    if plant_df.empty:
+        return pd.DataFrame(columns=columns)
+    daily = aggregate_plant_daily(plant_df)
+    return daily[columns].sort_values("date", ascending=False)
+
+
+def _trend_label(series_df: pd.DataFrame, value_col: str) -> str:
+    if series_df.empty or value_col not in series_df.columns:
+        return "N/A"
+    clean = series_df[["date", value_col]].dropna().sort_values("date")
+    if len(clean) < 2:
+        return "Stable"
+    change = clean[value_col].iloc[-1] - clean[value_col].iloc[0]
+    if pd.isna(change):
+        return "N/A"
+    if change > 0:
+        return "Improving"
+    if change < 0:
+        return "Softening"
+    return "Stable"
+
+
+def _sparkline_data(series_df: pd.DataFrame, value_col: str, max_points: int = 12) -> pd.DataFrame:
+    if series_df.empty or value_col not in series_df.columns:
+        return pd.DataFrame(columns=["date", value_col])
+    return series_df[["date", value_col]].dropna().sort_values("date").tail(max_points)
+
+
+def _card(metric: str, actual: float, previous: float, series_df: pd.DataFrame, reason: str = "") -> Dict[str, Any]:
+    delta = actual - previous if pd.notna(actual) and pd.notna(previous) else float("nan")
+    return {
+        "metric": metric,
+        "label": METRIC_DEFINITIONS[metric]["label"],
+        "actual": actual,
+        "previous": previous,
+        "delta": delta,
+        "trend_label": _trend_label(series_df, metric),
+        "sparkline": _sparkline_data(series_df, metric),
+        "status": "N/A" if pd.isna(actual) else "OK",
+        "reason": reason,
+        "direction": METRIC_DEFINITIONS[metric]["direction"],
+    }
+
+
+def _build_overview_cards(
+    current_mine: pd.DataFrame,
+    previous_mine: pd.DataFrame,
+    current_fleet: pd.DataFrame,
+    previous_fleet: pd.DataFrame,
+    current_plant: pd.DataFrame,
+    previous_plant: pd.DataFrame,
+    current_mine_daily: pd.DataFrame,
+    current_plant_daily: pd.DataFrame,
+) -> List[Dict[str, Any]]:
+    diesel_daily = (
+        current_fleet.groupby("date", as_index=False)["diesel_l"].sum(min_count=1).sort_values("date")
+        if not current_fleet.empty and {"date", "diesel_l"}.issubset(current_fleet.columns)
+        else pd.DataFrame(columns=["date", "diesel_l"])
     )
+    return [
+        _card("bcm_moved", _sum_column(current_mine, "bcm_moved"), _sum_column(previous_mine, "bcm_moved"), current_mine_daily, reason="Requires daily_mine.bcm_moved."),
+        _card("ore_mined_t", _sum_column(current_mine, "ore_mined_t"), _sum_column(previous_mine, "ore_mined_t"), current_mine_daily, reason="Requires daily_mine.ore_mined_t."),
+        _card("stripping_ratio", _safe_div(_sum_column(current_mine, "waste_bcm"), _sum_column(current_mine, "ore_bcm")), _safe_div(_sum_column(previous_mine, "waste_bcm"), _sum_column(previous_mine, "ore_bcm")), current_mine_daily, reason="Requires positive waste_bcm and ore_bcm."),
+        _card("diesel_l", _sum_column(current_fleet, "diesel_l"), _sum_column(previous_fleet, "diesel_l"), diesel_daily, reason="Requires daily_fleet.diesel_l."),
+        _card("feed_tonnes", _sum_column(current_plant, "feed_tonnes"), _sum_column(previous_plant, "feed_tonnes"), current_plant_daily, reason="Requires daily_plant.feed_tonnes."),
+        _card("throughput_tph", current_plant_daily["throughput_tph"].mean() if "throughput_tph" in current_plant_daily.columns else float("nan"), previous_plant["throughput_tph"].mean() if not previous_plant.empty and "throughput_tph" in previous_plant.columns else float("nan"), current_plant_daily, reason="Requires daily_plant.throughput_tph."),
+        _card("recovery_pct", _weighted_average(current_plant, "recovery_pct", "feed_tonnes"), _weighted_average(previous_plant, "recovery_pct", "feed_tonnes"), current_plant_daily, reason="Requires daily_plant.recovery_pct and feed_tonnes."),
+        _card("metal_produced_t", _sum_column(current_plant, "metal_produced_t"), _sum_column(previous_plant, "metal_produced_t"), current_plant_daily, reason="Requires daily_plant.metal_produced_t."),
+    ]
+
+
+def build_readout(cards: List[Dict[str, Any]], quality_summary: pd.DataFrame, period_days: int) -> str:
+    card_map = {card["metric"]: card for card in cards}
+
+    def signal(metric: str) -> float:
+        return float(card_map.get(metric, {}).get("delta", float("nan")))
+
+    def phrase(value: float, positive: str, negative: str, neutral: str) -> str:
+        if pd.isna(value):
+            return neutral
+        if value > 0:
+            return positive
+        if value < 0:
+            return negative
+        return neutral
+
+    movement = phrase(signal("ore_mined_t"), "ore output improved", "ore output softened", "ore output held broadly steady")
+    plant = phrase(signal("recovery_pct"), "recovery strengthened", "recovery eased", "recovery stayed close to the prior period")
+    fleet = phrase(signal("diesel_l"), "diesel burn increased", "diesel burn eased", "diesel burn stayed stable")
+
+    trust = "Data quality looks healthy."
+    if not quality_summary.empty:
+        row = quality_summary.iloc[0]
+        if row.get("error_count", 0) > 0:
+            trust = "Data quality needs attention before treating every number as decision-grade."
+        elif row.get("warning_count", 0) > 0:
+            trust = "Data quality has a few warnings, but the operating picture is still usable."
+
+    if period_days <= 1:
+        return f"This snapshot shows that {movement}, while {plant} and {fleet}. {trust}"
+    return f"Against the previous {period_days}-day period, {movement}, {plant}, and {fleet}. {trust}"
+
+
+def build_change_strip(cards: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for card in cards:
+        if pd.isna(card.get("delta")):
+            continue
+        rows.append(
+            {
+                "metric": card["metric"],
+                "label": card["label"],
+                "delta": float(card["delta"]),
+                "direction": card.get("direction", "neutral"),
+                "magnitude": abs(float(card["delta"])),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["metric", "label", "delta", "direction", "magnitude"])
+    out = pd.DataFrame(rows).sort_values("magnitude", ascending=False)
+    return out.head(4)
+
+
+def compute_overview(site_data: Dict[str, pd.DataFrame], filters: FilterState, quality_summary: pd.DataFrame | None = None) -> Dict[str, Any]:
+    current_mine = filter_date_range(site_data.get("daily_mine", pd.DataFrame()), filters.date_from, filters.date_to)
+    current_fleet = filter_date_range(site_data.get("daily_fleet", pd.DataFrame()), filters.date_from, filters.date_to)
+    current_plant = filter_date_range(site_data.get("daily_plant", pd.DataFrame()), filters.date_from, filters.date_to)
+    prev_from, prev_to, period_days = _previous_period(filters.date_from, filters.date_to)
+    previous_mine = filter_date_range(site_data.get("daily_mine", pd.DataFrame()), prev_from, prev_to)
+    previous_fleet = filter_date_range(site_data.get("daily_fleet", pd.DataFrame()), prev_from, prev_to)
+    previous_plant = filter_date_range(site_data.get("daily_plant", pd.DataFrame()), prev_from, prev_to)
+
+    current_mine_daily = aggregate_mine_daily(current_mine)
+    current_plant_daily = aggregate_plant_daily(current_plant)
+    cards = _build_overview_cards(current_mine, previous_mine, current_fleet, previous_fleet, current_plant, previous_plant, current_mine_daily, current_plant_daily)
+    availability_groups = aggregate_availability_groups(current_fleet)
+    area_contribution = aggregate_area_contribution(current_mine)
 
     return {
         "cards": cards,
-        "exc_daily": exc_daily,
-        "trk_daily": trk_daily,
+        "mine_daily": current_mine_daily,
+        "plant_daily": current_plant_daily,
+        "availability_groups": availability_groups,
+        "area_contribution": area_contribution,
+        "readout": build_readout(cards, quality_summary if quality_summary is not None else pd.DataFrame(), period_days),
+        "change_strip": build_change_strip(cards),
+        "period_days": period_days,
     }
 
 
-def _build_utilization(df: pd.DataFrame) -> pd.Series:
-    if "standby_h" in df.columns:
-        denom = df["operating_h"] + df["idle_h"] + df["standby_h"] + df["down_h"]
-    else:
-        denom = df["operating_h"] + df["idle_h"] + df["down_h"]
-    return df["operating_h"] / denom.where(denom > 0)
+def compute_mine_page(
+    site_data: Dict[str, pd.DataFrame],
+    filters: FilterState,
+    area_names: Optional[List[str]] = None,
+    equipment_groups: Optional[List[str]] = None,
+    equipment_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    area_names = list(area_names or [])
+    equipment_groups = list(equipment_groups or [])
+    equipment_ids = list(equipment_ids or [])
 
+    mine_current = filter_date_range(site_data.get("daily_mine", pd.DataFrame()), filters.date_from, filters.date_to)
+    fleet_current = filter_date_range(site_data.get("daily_fleet", pd.DataFrame()), filters.date_from, filters.date_to)
 
-def compute_excavator_kpis(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
+    if area_names and "area_name" in mine_current.columns:
+        mine_current = mine_current[mine_current["area_name"].isin(area_names)]
+    if area_names and "area_name" in fleet_current.columns:
+        fleet_current = fleet_current[fleet_current["area_name"].isin(area_names)]
+    if equipment_groups and "mine_filter_group" in fleet_current.columns:
+        fleet_current = fleet_current[fleet_current["mine_filter_group"].isin(equipment_groups)]
+    if equipment_ids and "equipment_id" in fleet_current.columns:
+        fleet_current = fleet_current[fleet_current["equipment_id"].isin(equipment_ids)]
 
-    required = {"date", "shift", "site_id", "area_id", "equipment_id"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame()
+    mine_daily = aggregate_mine_daily(mine_current)
+    availability_daily = aggregate_availability_groups(fleet_current)
+    diesel_groups = aggregate_diesel_groups(fleet_current)
+    unit_ranking = summarize_units(fleet_current)
+    top_diesel = unit_ranking.sort_values("diesel_l", ascending=False, na_position="last").head(10) if not unit_ranking.empty else pd.DataFrame()
+    bottom_diesel = unit_ranking[unit_ranking["diesel_l"] > 0].sort_values("diesel_l", ascending=True, na_position="last").head(10) if not unit_ranking.empty else pd.DataFrame()
 
-    value_cols = ["tonnes_loaded", "operating_h", "down_h", "idle_h"]
-    agg_map: Dict[str, Any] = {col: "sum" for col in value_cols if col in df.columns}
-
-    for optional_sum in ["standby_h", "cycles_count", "fuel_l"]:
-        if optional_sum in df.columns:
-            agg_map[optional_sum] = "sum"
-
-    for optional_avg in ["avg_cycle_time_s", "bucket_fill_factor"]:
-        if optional_avg in df.columns:
-            agg_map[optional_avg] = "mean"
-
-    grouped = (
-        df.groupby(["date", "shift", "site_id", "area_id", "equipment_id"], as_index=False)
-        .agg(agg_map)
-        .sort_values(["date", "shift", "equipment_id"])
-    )
-
-    if {"operating_h", "down_h"}.issubset(grouped.columns):
-        grouped["availability_pct"] = grouped["operating_h"] / (
-            grouped["operating_h"] + grouped["down_h"]
-        ).where((grouped["operating_h"] + grouped["down_h"]) > 0)
-    else:
-        grouped["availability_pct"] = float("nan")
-
-    if {"operating_h", "down_h", "idle_h"}.issubset(grouped.columns):
-        grouped["utilization_pct"] = _build_utilization(grouped)
-    else:
-        grouped["utilization_pct"] = float("nan")
-
-    if {"tonnes_loaded", "operating_h"}.issubset(grouped.columns):
-        grouped["tonnes_per_operating_hour"] = grouped["tonnes_loaded"] / grouped["operating_h"].where(
-            grouped["operating_h"] > 0
-        )
-    else:
-        grouped["tonnes_per_operating_hour"] = float("nan")
-
-    if {"cycles_count", "operating_h"}.issubset(grouped.columns):
-        grouped["cycles_per_hour"] = grouped["cycles_count"] / grouped["operating_h"].where(grouped["operating_h"] > 0)
-
-    return grouped
-
-
-def compute_truck_kpis(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-
-    required = {"date", "shift", "site_id", "area_id", "equipment_id"}
-    if not required.issubset(df.columns):
-        return pd.DataFrame()
-
-    agg_map: Dict[str, Any] = {}
-    for col in ["tonnes_hauled", "trips", "operating_h", "down_h", "idle_h", "standby_h", "fuel_l"]:
-        if col in df.columns:
-            agg_map[col] = "sum"
-
-    for col in [
-        "payload_target_t",
-        "cycle_time_min",
-        "queue_time_min",
-        "speed_kmph_avg",
-        "distance_km_avg",
-    ]:
-        if col in df.columns:
-            agg_map[col] = "mean"
-
-    grouped = (
-        df.groupby(["date", "shift", "site_id", "area_id", "equipment_id"], as_index=False)
-        .agg(agg_map)
-        .sort_values(["date", "shift", "equipment_id"])
-    )
-
-    if {"operating_h", "down_h"}.issubset(grouped.columns):
-        grouped["availability_pct"] = grouped["operating_h"] / (
-            grouped["operating_h"] + grouped["down_h"]
-        ).where((grouped["operating_h"] + grouped["down_h"]) > 0)
-    else:
-        grouped["availability_pct"] = float("nan")
-
-    if {"operating_h", "down_h", "idle_h"}.issubset(grouped.columns):
-        grouped["utilization_pct"] = _build_utilization(grouped)
-    else:
-        grouped["utilization_pct"] = float("nan")
-
-    if {"tonnes_hauled", "operating_h"}.issubset(grouped.columns):
-        grouped["tonnes_per_operating_hour"] = grouped["tonnes_hauled"] / grouped["operating_h"].where(
-            grouped["operating_h"] > 0
-        )
-    else:
-        grouped["tonnes_per_operating_hour"] = float("nan")
-
-    if {"tonnes_hauled", "trips"}.issubset(grouped.columns):
-        grouped["avg_payload_t"] = grouped["tonnes_hauled"] / grouped["trips"].where(grouped["trips"] > 0)
-    else:
-        grouped["avg_payload_t"] = float("nan")
-
-    if {"avg_payload_t", "payload_target_t"}.issubset(grouped.columns):
-        grouped["payload_compliance_pct"] = grouped["avg_payload_t"] / grouped["payload_target_t"].where(
-            grouped["payload_target_t"] > 0
-        )
-    else:
-        grouped["payload_compliance_pct"] = float("nan")
-
-    if {"tonnes_hauled", "distance_km_avg"}.issubset(grouped.columns):
-        grouped["tkm"] = grouped["tonnes_hauled"] * grouped["distance_km_avg"]
-    else:
-        grouped["tkm"] = float("nan")
-
-    if {"fuel_l", "tkm"}.issubset(grouped.columns):
-        grouped["l_per_tkm"] = grouped["fuel_l"] / grouped["tkm"].where(grouped["tkm"] > 0)
-    else:
-        grouped["l_per_tkm"] = float("nan")
-
-    return grouped
-
-
-def summarize_unit_ranking(kpi_df: pd.DataFrame, equipment_class: str) -> pd.DataFrame:
-    if kpi_df.empty or "equipment_id" not in kpi_df.columns:
-        return pd.DataFrame()
-
-    agg_map: Dict[str, Any] = {
-        "tonnes_per_operating_hour": "mean",
-        "availability_pct": "mean",
+    return {
+        "mine_daily": mine_daily,
+        "availability_daily": availability_daily,
+        "utilization_daily": availability_daily,
+        "diesel_groups": diesel_groups,
+        "unit_ranking": unit_ranking,
+        "top_diesel": top_diesel,
+        "bottom_diesel": bottom_diesel,
+        "filtered_units": fleet_current,
     }
-    for optional in [
-        "down_h",
-        "queue_time_min",
-        "cycle_time_min",
-        "avg_payload_t",
-        "payload_compliance_pct",
-        "tonnes_hauled",
-        "tonnes_loaded",
-    ]:
-        if optional in kpi_df.columns:
-            agg_map[optional] = "mean" if optional.endswith("_min") else "sum"
-
-    by_unit = kpi_df.groupby("equipment_id", as_index=False).agg(agg_map)
-
-    if equipment_class == "excavator":
-        sort_cols = [col for col in ["tonnes_per_operating_hour", "availability_pct", "down_h"] if col in by_unit.columns]
-        ascending = [True, True, False][: len(sort_cols)]
-    else:
-        sort_cols = [col for col in ["tonnes_per_operating_hour", "queue_time_min", "availability_pct"] if col in by_unit.columns]
-        ascending = [True, False, True][: len(sort_cols)]
-
-    if sort_cols:
-        by_unit = by_unit.sort_values(sort_cols, ascending=ascending)
-
-    return by_unit
 
 
-def build_top_exceptions_excavator(kpi_df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
-    ranking = summarize_unit_ranking(kpi_df, "excavator")
-    if ranking.empty:
-        return ranking
-
-    out = ranking.head(top_n).copy()
-
-    def _reason(row: pd.Series) -> str:
-        reasons: List[str] = []
-        if "availability_pct" in row and pd.notna(row["availability_pct"]):
-            reasons.append(f"Low availability ({row['availability_pct']:.0%})")
-        if "down_h" in row and pd.notna(row["down_h"]):
-            reasons.append(f"High down_h ({row['down_h']:.1f}h)")
-        return ", ".join(reasons[:2]) if reasons else "Low productivity"
-
-    out["reason"] = out.apply(_reason, axis=1)
-    return out
+def compute_plant_page(site_data: Dict[str, pd.DataFrame], filters: FilterState) -> Dict[str, Any]:
+    plant_current = filter_date_range(site_data.get("daily_plant", pd.DataFrame()), filters.date_from, filters.date_to)
+    plant_daily = aggregate_plant_daily(plant_current)
+    return {
+        "plant_daily": plant_daily,
+        "plant_rows": plant_current,
+        "daily_table": build_daily_operating_table(plant_current),
+    }
 
 
-def build_top_exceptions_truck(kpi_df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
-    ranking = summarize_unit_ranking(kpi_df, "truck")
-    if ranking.empty:
-        return ranking
-
-    out = ranking.head(top_n).copy()
-
-    def _reason(row: pd.Series) -> str:
-        reasons: List[str] = []
-        if "availability_pct" in row and pd.notna(row["availability_pct"]):
-            reasons.append(f"Low availability ({row['availability_pct']:.0%})")
-        if "cycle_time_min" in row and pd.notna(row["cycle_time_min"]):
-            reasons.append(f"High cycle ({row['cycle_time_min']:.1f} min)")
-        if "queue_time_min" in row and pd.notna(row["queue_time_min"]):
-            reasons.append(f"High queue ({row['queue_time_min']:.1f} min)")
-        return ", ".join(reasons[:2]) if reasons else "Low productivity"
-
-    out["reason"] = out.apply(_reason, axis=1)
-    return out
-
-
-def build_top_area_exceptions(truck_kpi_df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
-    if truck_kpi_df.empty or "area_id" not in truck_kpi_df.columns:
-        return pd.DataFrame()
-
-    agg_map: Dict[str, Any] = {}
-    if "queue_time_min" in truck_kpi_df.columns:
-        agg_map["queue_time_min"] = "mean"
-    if "payload_compliance_pct" in truck_kpi_df.columns:
-        agg_map["payload_compliance_pct"] = "mean"
-    if not agg_map:
-        return pd.DataFrame()
-
-    by_area = truck_kpi_df.groupby("area_id", as_index=False).agg(agg_map)
-
-    if "queue_time_min" in by_area.columns and by_area["queue_time_min"].notna().any():
-        out = by_area.sort_values("queue_time_min", ascending=False).head(top_n).copy()
-        out["reason"] = out["queue_time_min"].apply(lambda x: f"High queue time ({x:.1f} min)")
-    elif "payload_compliance_pct" in by_area.columns:
-        out = by_area.sort_values("payload_compliance_pct", ascending=True).head(top_n).copy()
-        out["reason"] = out["payload_compliance_pct"].apply(lambda x: f"Low payload compliance ({x:.0%})")
-    else:
-        out = pd.DataFrame()
-
-    return out
-
-
-def compute_route_ranking(route_df: pd.DataFrame) -> pd.DataFrame:
-    if route_df.empty:
-        return pd.DataFrame()
-
-    required = {"from_area_id", "to_area_id"}
-    if not required.issubset(route_df.columns):
-        return pd.DataFrame()
-
-    agg_map: Dict[str, Any] = {}
-    for col in ["tonnes", "trips"]:
-        if col in route_df.columns:
-            agg_map[col] = "sum"
-    for col in ["distance_km", "cycle_time_min", "queue_time_min"]:
-        if col in route_df.columns:
-            agg_map[col] = "mean"
-
-    if not agg_map:
-        return pd.DataFrame()
-
-    rank = (
-        route_df.groupby(["from_area_id", "to_area_id"], as_index=False)
-        .agg(agg_map)
-        .sort_values(
-            [c for c in ["queue_time_min", "cycle_time_min", "tonnes"] if c in agg_map],
-            ascending=[False, False, False][: len([c for c in ["queue_time_min", "cycle_time_min", "tonnes"] if c in agg_map])],
-        )
-    )
-    return rank
+def compute_fleet_page(site_data: Dict[str, pd.DataFrame], filters: FilterState) -> Dict[str, Any]:
+    fleet_current = filter_date_range(site_data.get("daily_fleet", pd.DataFrame()), filters.date_from, filters.date_to)
+    return {
+        "availability_daily": aggregate_availability_groups(fleet_current),
+        "diesel_groups": aggregate_diesel_groups(fleet_current),
+        "unit_ranking": summarize_units(fleet_current),
+        "fleet_rows": fleet_current,
+    }
 
 
 def build_kpi_availability_report(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    checks = [
-        ("excavator", "tonnes_loaded", "fact_shift_excavator", ["tonnes_loaded"]),
-        ("excavator", "availability_pct", "fact_shift_excavator", ["operating_h", "down_h"]),
-        ("excavator", "utilization_pct", "fact_shift_excavator", ["operating_h", "idle_h", "down_h"]),
-        ("excavator", "tonnes_per_operating_hour", "fact_shift_excavator", ["tonnes_loaded", "operating_h"]),
-        ("excavator", "cycles_per_hour", "fact_shift_excavator", ["cycles_count", "operating_h"]),
-        ("truck", "tonnes_hauled", "fact_shift_truck", ["tonnes_hauled"]),
-        ("truck", "availability_pct", "fact_shift_truck", ["operating_h", "down_h"]),
-        ("truck", "utilization_pct", "fact_shift_truck", ["operating_h", "idle_h", "down_h"]),
-        ("truck", "tonnes_per_operating_hour", "fact_shift_truck", ["tonnes_hauled", "operating_h"]),
-        ("truck", "avg_payload_t", "fact_shift_truck", ["tonnes_hauled", "trips"]),
-        ("truck", "payload_compliance_pct", "fact_shift_truck", ["tonnes_hauled", "trips", "payload_target_t"]),
-        ("truck", "cycle_time_min", "fact_shift_truck", ["cycle_time_min"]),
-        ("truck", "queue_time_min", "fact_shift_truck", ["queue_time_min"]),
-        ("truck", "tkm", "fact_shift_truck", ["tonnes_hauled", "distance_km_avg"]),
-        ("truck", "l_per_tkm", "fact_shift_truck", ["fuel_l", "tonnes_hauled", "distance_km_avg"]),
-    ]
-
-    rows: List[Dict[str, Any]] = []
-    for equipment_class, metric, sheet_name, required_cols in checks:
-        df = sheets.get(sheet_name, pd.DataFrame())
-        missing = [col for col in required_cols if col not in df.columns]
-        if missing:
-            status = "N/A"
-            reason = f"Missing columns: {', '.join(missing)}"
-        else:
-            status = "Available"
-            reason = "OK"
-
-        rows.append(
+    field_guide = build_field_guide()
+    metric_rows: List[Dict[str, Any]] = []
+    mapping = {
+        "BCM moved": [("daily_mine", "bcm_moved")],
+        "Ore mined (t)": [("daily_mine", "ore_mined_t")],
+        "Stripping ratio": [("daily_mine", "waste_bcm"), ("daily_mine", "ore_bcm")],
+        "Diesel consumption": [("daily_fleet", "diesel_l")],
+        "Feed tonnes": [("daily_plant", "feed_tonnes")],
+        "Throughput": [("daily_plant", "throughput_tph")],
+        "Recovery": [("daily_plant", "recovery_pct"), ("daily_plant", "feed_tonnes")],
+        "Metal produced": [("daily_plant", "metal_produced_t")],
+        "Availability": [("daily_fleet", "availability_pct")],
+        "Utilization": [("daily_fleet", "utilization_pct")],
+        "Feed grade": [("daily_plant", "feed_grade_pct"), ("daily_plant", "feed_tonnes")],
+        "Unplanned downtime": [("daily_plant", "unplanned_downtime_h")],
+    }
+    for metric_name, meta in METRIC_DEFINITIONS.items():
+        deps = mapping.get(meta["label"], [])
+        missing = []
+        for sheet_name, field_name in deps:
+            df = sheets.get(sheet_name, pd.DataFrame())
+            if field_name not in df.columns:
+                missing.append(f"{sheet_name}.{field_name}")
+        metric_rows.append(
             {
-                "equipment_class": equipment_class,
-                "metric": metric,
-                "status": status,
-                "reason": reason,
+                "domain": meta["domain"],
+                "metric": meta["label"],
+                "status": "Available" if not missing else "N/A",
+                "reason": "OK" if not missing else f"Missing: {', '.join(missing)}",
             }
         )
-
-    return pd.DataFrame(rows)
+    return pd.DataFrame(metric_rows)

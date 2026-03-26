@@ -2,89 +2,83 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
 from src.charts import (
-    COLORS,
+    area_contribution_chart,
     coverage_heatmap,
-    exceptions_bar,
-    payload_distribution,
-    productivity_scatter,
-    trend_with_target,
-    unit_timeline,
+    diesel_stacked_chart,
+    downtime_availability_combo,
+    grade_recovery_scatter,
+    group_metric_chart,
+    issue_severity_chart,
+    metal_production_trend,
+    mine_production_combo,
+    mine_volume_trend,
+    plant_feed_throughput_combo,
+    plant_performance_combo,
+    rank_bar,
+    sparkline_figure,
+    stripping_ratio_trend,
+    unit_heatmap,
+    unit_timeline_chart,
 )
-from src.io_excel import WorkbookData, load_excel_workbook
+from src.io_excel import WorkbookData, build_field_guide, build_schema_overview, load_excel_workbook
 from src.kpi import (
     FilterState,
+    MINE_FILTER_GROUP_ORDER,
     build_kpi_availability_report,
-    build_top_area_exceptions,
-    build_top_exceptions_excavator,
-    build_top_exceptions_truck,
-    compute_excavator_kpis,
+    build_unit_heatmap_data,
+    build_unit_timeline,
+    compute_fleet_page,
+    compute_mine_page,
     compute_overview,
-    compute_route_ranking,
-    compute_truck_kpis,
-    filter_all_facts,
-    resolve_target,
-    summarize_unit_ranking,
+    compute_plant_page,
+    prepare_site_data,
 )
+from src.theme import APP_CSS, TOKENS
 
 
 DEFAULT_INPUT_PATH = Path("./data/mine_productivity_input.xlsx")
 FALLBACK_SAMPLE_PATH = Path("./data/sample_mine_productivity_input.xlsx")
+TEMPLATE_PATH = Path("./data/mine_productivity_input_template.xlsx")
+MINE_CARD_ORDER = ["bcm_moved", "ore_mined_t", "stripping_ratio", "diesel_l"]
+PLANT_CARD_ORDER = ["feed_tonnes", "throughput_tph", "recovery_pct", "metal_produced_t"]
+AVAILABILITY_GROUP_ORDER = ["Excavators", "Trucks", "Drills", "Ancillary"]
 
 
-st.set_page_config(
-    page_title="Mining Productivity Dashboard",
-    page_icon=":bar_chart:",
-    layout="wide",
-)
-
-st.markdown(
-    f"""
-<style>
-.main {{
-    background-color: {COLORS['bg']};
-}}
-[data-testid="stMetricValue"] {{
-    font-size: 1.35rem;
-}}
-.small-note {{
-    color: {COLORS['muted']};
-    font-size: 0.85rem;
-}}
-</style>
-""",
-    unsafe_allow_html=True,
-)
+st.set_page_config(page_title="Mining Operations Executive Dashboard", page_icon=":mountain:", layout="wide")
+st.markdown(APP_CSS, unsafe_allow_html=True)
 
 
-CARD_LABELS = {
-    "excavator_tonnes_loaded": "Excavators Tonnes Loaded",
-    "excavator_tonnes_per_operating_hour": "Excavator TPH",
-    "excavator_availability_pct": "Excavator Availability",
-    "truck_tonnes_hauled": "Trucks Tonnes Hauled",
-    "truck_tonnes_per_operating_hour": "Truck TPH",
-    "truck_availability_pct": "Truck Availability",
-    "avg_payload_t": "Average Payload",
-    "avg_cycle_time_min": "Average Cycle Time",
-    "avg_queue_time_min": "Average Queue Time",
+METRIC_META = {
+    "bcm_moved": {"label": "BCM moved", "kind": "number", "direction": "up"},
+    "ore_mined_t": {"label": "Ore mined (t)", "kind": "number", "direction": "up"},
+    "stripping_ratio": {"label": "Stripping ratio", "kind": "ratio", "direction": "neutral"},
+    "diesel_l": {"label": "Diesel consumption", "kind": "diesel", "direction": "neutral"},
+    "feed_tonnes": {"label": "Feed tonnes", "kind": "number", "direction": "up"},
+    "throughput_tph": {"label": "Throughput", "kind": "throughput", "direction": "up"},
+    "recovery_pct": {"label": "Recovery", "kind": "pct", "direction": "up"},
+    "metal_produced_t": {"label": "Metal produced", "kind": "number", "direction": "up"},
+    "feed_grade_pct": {"label": "Feed grade", "kind": "pct", "direction": "neutral"},
+    "availability_pct": {"label": "Availability", "kind": "pct", "direction": "up"},
+    "utilization_pct": {"label": "Utilization", "kind": "pct", "direction": "up"},
+    "unplanned_downtime_h": {"label": "Unplanned downtime", "kind": "hours", "direction": "down"},
 }
 
-CARD_ORDER = [
-    "excavator_tonnes_loaded",
-    "excavator_tonnes_per_operating_hour",
-    "excavator_availability_pct",
-    "truck_tonnes_hauled",
-    "truck_tonnes_per_operating_hour",
-    "truck_availability_pct",
-    "avg_payload_t",
-    "avg_cycle_time_min",
-    "avg_queue_time_min",
-]
+METRIC_COLORS = {
+    "bcm_moved": TOKENS["mine"],
+    "ore_mined_t": TOKENS["ore"],
+    "stripping_ratio": TOKENS["accent"],
+    "diesel_l": TOKENS["diesel"],
+    "feed_tonnes": TOKENS["plant"],
+    "throughput_tph": TOKENS["ore"],
+    "recovery_pct": TOKENS["recovery"],
+    "metal_produced_t": TOKENS["metal"],
+}
 
 
 @st.cache_data(show_spinner=False)
@@ -98,604 +92,615 @@ def cached_load_from_bytes(content: bytes) -> WorkbookData:
 
 
 @st.cache_data(show_spinner=False)
-def cached_compute(
-    filtered_exc: pd.DataFrame,
-    filtered_trk: pd.DataFrame,
-    filtered_route: pd.DataFrame,
-    targets: pd.DataFrame,
-    site_id: str,
-    date_from: Optional[date],
-    date_to: Optional[date],
-    shift: str,
-    area_ids: List[str],
-    equipment_ids: List[str],
-) -> Dict[str, Any]:
-    filters = FilterState(
-        site_id=site_id,
-        date_from=date_from,
-        date_to=date_to,
-        shift=shift,
-        area_ids=area_ids,
-        equipment_ids=equipment_ids,
-    )
-    overview = compute_overview(filtered_exc, filtered_trk, targets, filters)
-    exc_kpi = compute_excavator_kpis(filtered_exc)
-    trk_kpi = compute_truck_kpis(filtered_trk)
-    route_rank = compute_route_ranking(filtered_route)
-    return {
-        "overview": overview,
-        "exc_kpi": exc_kpi,
-        "trk_kpi": trk_kpi,
-        "route_rank": route_rank,
-    }
+def cached_template_bytes(path_str: str) -> bytes:
+    return Path(path_str).read_bytes()
+
+
+@st.cache_data(show_spinner=False)
+def cached_schema_overview() -> pd.DataFrame:
+    return build_schema_overview()
+
+
+@st.cache_data(show_spinner=False)
+def cached_field_guide() -> pd.DataFrame:
+    return build_field_guide()
 
 
 def _compact_number(value: float) -> str:
-    abs_v = abs(value)
-    if abs_v >= 1_000_000:
+    abs_value = abs(value)
+    if abs_value >= 1_000_000:
         return f"{value / 1_000_000:.1f}M"
-    if abs_v >= 1_000:
+    if abs_value >= 1_000:
         return f"{value / 1_000:.1f}k"
-    return f"{value:,.1f}"
+    return f"{value:,.0f}"
 
 
-def format_metric_value(metric: str, value: float) -> str:
+def _format_metric(metric: str, value: float) -> str:
     if pd.isna(value):
         return "N/A"
-    if metric.endswith("_pct"):
+    kind = METRIC_META.get(metric, {}).get("kind", "number")
+    if kind == "pct":
         return f"{value:.1%}"
-    if metric.endswith("_min"):
-        return f"{value:.1f} min"
-    if metric.endswith("_t") or metric.endswith("_hour"):
-        return f"{value:,.1f}"
+    if kind == "ratio":
+        return f"{value:.2f}"
+    if kind == "diesel":
+        return f"{_compact_number(value)} L"
+    if kind == "throughput":
+        return f"{value:,.1f} t/h"
+    if kind == "hours":
+        return f"{value:,.1f} h"
     return _compact_number(value)
 
 
-def format_metric_delta(metric: str, value: float) -> str:
-    if pd.isna(value):
+def _format_delta(metric: str, delta: float) -> str:
+    if pd.isna(delta):
+        return "No previous-period comparison"
+    sign = "+" if delta >= 0 else ""
+    kind = METRIC_META.get(metric, {}).get("kind", "number")
+    if kind == "pct":
+        return f"{sign}{delta * 100:.1f} pp"
+    if kind == "ratio":
+        return f"{sign}{delta:.2f}"
+    if kind == "diesel":
+        return f"{sign}{_compact_number(delta)} L"
+    if kind == "throughput":
+        return f"{sign}{delta:,.1f} t/h"
+    if kind == "hours":
+        return f"{sign}{delta:,.1f} h"
+    return f"{sign}{_compact_number(delta)}"
+
+
+def _delta_color(metric: str, delta: float) -> str:
+    direction = METRIC_META.get(metric, {}).get("direction", "neutral")
+    if pd.isna(delta) or direction == "neutral":
+        return TOKENS["muted"]
+    if direction == "up":
+        return TOKENS["good"] if delta >= 0 else TOKENS["bad"]
+    return TOKENS["good"] if delta <= 0 else TOKENS["bad"]
+
+
+def _delta_chip_class(metric: str, delta: float) -> str:
+    direction = METRIC_META.get(metric, {}).get("direction", "neutral")
+    if pd.isna(delta) or direction == "neutral":
+        return "change-pill-neutral"
+    if direction == "up":
+        return "change-pill-good" if delta >= 0 else "change-pill-bad"
+    return "change-pill-good" if delta <= 0 else "change-pill-bad"
+
+
+def _format_date_label(value: Optional[date]) -> str:
+    if value is None or pd.isna(value):
         return "N/A"
-    sign = "+" if value >= 0 else ""
-    if metric.endswith("_pct"):
-        return f"{sign}{value:.1%}"
-    if metric.endswith("_min"):
-        return f"{sign}{value:.1f} min"
-    if metric.endswith("_t") or metric.endswith("_hour"):
-        return f"{sign}{value:,.1f}"
-    return f"{sign}{_compact_number(value)}"
+    return pd.Timestamp(value).strftime("%b %d, %Y").replace(" 0", " ")
 
 
-def render_card(card: Dict[str, Any], container: Any) -> None:
-    metric = card["metric"]
-    label = CARD_LABELS.get(metric, metric)
-    actual = card.get("actual", float("nan"))
-    target = card.get("target", float("nan"))
-    delta = card.get("delta", float("nan"))
-
-    target_label = format_metric_value(metric, target)
-    delta_label = format_metric_delta(metric, delta)
-
-    container.metric(label=label, value=format_metric_value(metric, actual), delta=delta_label)
-    container.caption(f"Target: {target_label} | Trend: {card.get('trend_label', 'N/A')}")
-
-    if card.get("status") == "N/A" and card.get("reason"):
-        container.markdown(f"<div class='small-note'>Reason: {card['reason']}</div>", unsafe_allow_html=True)
+def _range_text(date_from: date, date_to: date) -> str:
+    return f"{_format_date_label(date_from)} to {_format_date_label(date_to)}"
 
 
-def _get_site_options(sheets: Dict[str, pd.DataFrame]) -> List[str]:
-    site_candidates: List[str] = []
-
-    dim_site = sheets.get("dim_site", pd.DataFrame())
-    if not dim_site.empty and "site_id" in dim_site.columns:
-        site_candidates.extend(dim_site["site_id"].dropna().astype(str).tolist())
-
-    for fact_name in ["fact_shift_excavator", "fact_shift_truck"]:
-        fact = sheets.get(fact_name, pd.DataFrame())
-        if not fact.empty and "site_id" in fact.columns:
-            site_candidates.extend(fact["site_id"].dropna().astype(str).tolist())
-
-    if not site_candidates:
-        return ["UNKNOWN_SITE"]
-
-    return sorted(set(site_candidates))
-
-
-def _site_date_bounds(sheets: Dict[str, pd.DataFrame], site_id: str) -> tuple[Optional[date], Optional[date]]:
-    dates: List[date] = []
-    for fact_name in ["fact_shift_excavator", "fact_shift_truck"]:
-        fact = sheets.get(fact_name, pd.DataFrame())
-        if fact.empty or "site_id" not in fact.columns or "date" not in fact.columns:
-            continue
-        scoped = fact[fact["site_id"] == site_id]
-        if scoped.empty:
-            continue
-        dates.extend(scoped["date"].dropna().tolist())
-
-    if not dates:
-        return None, None
-    return min(dates), max(dates)
+def _range_days(date_from: date, date_to: date) -> int:
+    return (date_to - date_from).days + 1
 
 
 def _safe_dataframe(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=columns)
-    missing = [col for col in columns if col not in df.columns]
     out = df.copy()
-    for col in missing:
-        out[col] = pd.NA
+    for col in columns:
+        if col not in out.columns:
+            out[col] = pd.NA
     return out[columns]
 
 
-def _render_messages(workbook: WorkbookData) -> None:
-    for err in workbook.errors:
-        st.error(err)
-    for warn in workbook.warnings:
-        st.warning(warn)
-
-
-def _build_source_section() -> WorkbookData:
-    st.sidebar.header("Data Source")
-    source_mode = st.sidebar.radio("Input", ["Default workbook", "Upload workbook"], index=0)
-
-    if source_mode == "Upload workbook":
-        upload = st.sidebar.file_uploader("Upload .xlsx", type=["xlsx"])
-        if upload is not None:
-            return cached_load_from_bytes(upload.getvalue())
-        st.sidebar.info("Upload an Excel workbook to replace the default source.")
-
+def _default_workbook() -> WorkbookData:
     if DEFAULT_INPUT_PATH.exists():
-        st.sidebar.success(f"Using: {DEFAULT_INPUT_PATH}")
         return cached_load_from_path(str(DEFAULT_INPUT_PATH))
-
     if FALLBACK_SAMPLE_PATH.exists():
-        st.sidebar.warning(
-            f"Default path not found ({DEFAULT_INPUT_PATH}). Falling back to sample workbook ({FALLBACK_SAMPLE_PATH})."
-        )
         return cached_load_from_path(str(FALLBACK_SAMPLE_PATH))
-
-    st.sidebar.error("No workbook found. Run scripts/make_template.py or upload a file.")
     return WorkbookData(
         sheets={},
-        errors=[
-            "No input workbook available. Expected ./data/mine_productivity_input.xlsx or ./data/sample_mine_productivity_input.xlsx."
-        ],
+        errors=["No workbook found. Generate the template and sample workbook or upload a workbook to continue."],
         warnings=[],
         quality={},
+        source_name="",
+        schema_version="",
+        source_kind="invalid",
     )
 
 
-def _build_global_filters(sheets: Dict[str, pd.DataFrame]) -> FilterState:
-    st.subheader("Global Filters")
-
-    site_options = _get_site_options(sheets)
-    default_site = site_options[0]
-
-    col_site, col_dates, col_shift, col_area, col_equip = st.columns([1.0, 1.5, 0.9, 1.2, 1.4])
-
-    site_id = col_site.selectbox("Site", options=site_options, index=0)
-    min_date, max_date = _site_date_bounds(sheets, site_id)
-
-    if min_date is None or max_date is None:
-        date_range = col_dates.date_input("Date range", value=())
-        date_from, date_to = None, None
-    else:
-        date_range = col_dates.date_input("Date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-        if isinstance(date_range, tuple) and len(date_range) == 2:
-            date_from, date_to = date_range
-        else:
-            date_from, date_to = min_date, max_date
-
-    shift = col_shift.selectbox("Shift", options=["All", "Day", "Night"], index=0)
-
-    area_options: List[str] = []
-    dim_area = sheets.get("dim_area", pd.DataFrame())
-    if not dim_area.empty and {"site_id", "area_id"}.issubset(dim_area.columns):
-        area_options = sorted(dim_area.loc[dim_area["site_id"] == site_id, "area_id"].dropna().astype(str).unique().tolist())
-
-    selected_areas = col_area.multiselect("Area", options=area_options, default=area_options)
-
-    equipment_options: List[str] = []
-    dim_equipment = sheets.get("dim_equipment", pd.DataFrame())
-    if not dim_equipment.empty and {"site_id", "equipment_id", "equipment_class"}.issubset(dim_equipment.columns):
-        scoped = dim_equipment[
-            (dim_equipment["site_id"] == site_id)
-            & (dim_equipment["equipment_class"].isin(["excavator", "truck"]))
-        ]
-        if selected_areas and "area_id" in scoped.columns:
-            scoped = scoped[scoped["area_id"].isin(selected_areas)]
-        equipment_options = sorted(scoped["equipment_id"].dropna().astype(str).unique().tolist())
-
-    selected_equipment = col_equip.multiselect("Equipment (optional)", options=equipment_options, default=[])
-
-    return FilterState(
-        site_id=site_id or default_site,
-        date_from=date_from,
-        date_to=date_to,
-        shift=shift,
-        area_ids=selected_areas,
-        equipment_ids=selected_equipment,
-    )
+def _site_name(metadata: pd.DataFrame) -> str:
+    if metadata.empty or "site_name" not in metadata.columns:
+        return "Mining Operations"
+    return str(metadata["site_name"].iloc[0])
 
 
-def render_overview(
-    results: Dict[str, Any],
-    targets: pd.DataFrame,
-    filters: FilterState,
-) -> None:
-    overview = results["overview"]
-    cards = overview["cards"]
-
-    card_map = {card["metric"]: card for card in cards}
-    selected_metrics = [metric for metric in CARD_ORDER if metric in card_map]
-
-    # Keep card deck clean with max 8 cards; show remaining driver metric in a compact line.
-    shown_metrics = selected_metrics[:8]
-    overflow_metrics = selected_metrics[8:]
-
-    st.markdown("### Overview KPI Cards")
-    cols = st.columns(4)
-    for idx, metric in enumerate(shown_metrics):
-        render_card(card_map[metric], cols[idx % 4])
-
-    if overflow_metrics:
-        compact_parts = []
-        for metric in overflow_metrics:
-            card = card_map[metric]
-            compact_parts.append(
-                f"{CARD_LABELS.get(metric, metric)}: {format_metric_value(metric, card.get('actual', float('nan')))} "
-                f"(Target {format_metric_value(metric, card.get('target', float('nan')))}, "
-                f"Delta {format_metric_delta(metric, card.get('delta', float('nan')))})"
-            )
-        st.info(" | ".join(compact_parts))
-
-    st.markdown("### Productivity Trends")
-    trend_col1, trend_col2 = st.columns(2)
-
-    exc_daily = overview["exc_daily"]
-    trk_daily = overview["trk_daily"]
-
-    exc_target = resolve_target(
-        targets,
-        filters.site_id,
-        "excavator",
-        "tonnes_per_operating_hour",
-        filters.area_ids,
-        filters.date_to,
-    )
-    trk_target = resolve_target(
-        targets,
-        filters.site_id,
-        "truck",
-        "tonnes_per_operating_hour",
-        filters.area_ids,
-        filters.date_to,
-    )
-
-    trend_col1.plotly_chart(
-        trend_with_target(
-            exc_daily,
-            value_col="tonnes_per_operating_hour",
-            title="Excavator TPH Trend vs Target",
-            y_title="Tonnes/Operating Hour",
-            target=exc_target,
-        ),
-        width="stretch",
-    )
-
-    trend_col2.plotly_chart(
-        trend_with_target(
-            trk_daily,
-            value_col="tonnes_per_operating_hour",
-            title="Truck TPH Trend vs Target",
-            y_title="Tonnes/Operating Hour",
-            target=trk_target,
-        ),
-        width="stretch",
-    )
-
-    st.markdown("### Top 5 Problems")
-    exc_top = build_top_exceptions_excavator(results["exc_kpi"], top_n=5)
-    trk_top = build_top_exceptions_truck(results["trk_kpi"], top_n=5)
-    area_top = build_top_area_exceptions(results["trk_kpi"], top_n=5)
-
-    col_a, col_b, col_c = st.columns(3)
-
-    with col_a:
-        st.markdown("**Excavators (Worst)**")
-        if exc_top.empty:
-            st.info("No excavator exception data.")
-        else:
-            value_col = "tonnes_per_operating_hour" if "tonnes_per_operating_hour" in exc_top.columns else exc_top.columns[1]
-            st.plotly_chart(
-                exceptions_bar(exc_top, "equipment_id", value_col, "Excavator Exception Ranking"),
-                width="stretch",
-            )
-            st.dataframe(
-                _safe_dataframe(exc_top, [c for c in ["equipment_id", "tonnes_per_operating_hour", "availability_pct", "down_h", "reason"] if c in exc_top.columns]),
-                width="stretch",
-                hide_index=True,
-            )
-
-    with col_b:
-        st.markdown("**Trucks (Worst)**")
-        if trk_top.empty:
-            st.info("No truck exception data.")
-        else:
-            value_col = "tonnes_per_operating_hour" if "tonnes_per_operating_hour" in trk_top.columns else trk_top.columns[1]
-            st.plotly_chart(
-                exceptions_bar(trk_top, "equipment_id", value_col, "Truck Exception Ranking"),
-                width="stretch",
-            )
-            st.dataframe(
-                _safe_dataframe(trk_top, [c for c in ["equipment_id", "tonnes_per_operating_hour", "availability_pct", "cycle_time_min", "queue_time_min", "reason"] if c in trk_top.columns]),
-                width="stretch",
-                hide_index=True,
-            )
-
-    with col_c:
-        st.markdown("**Areas (Worst)**")
-        if area_top.empty:
-            st.info("No area-level exception data.")
-        else:
-            value_col = "queue_time_min" if "queue_time_min" in area_top.columns else "payload_compliance_pct"
-            st.plotly_chart(
-                exceptions_bar(area_top, "area_id", value_col, "Area Exception Ranking"),
-                width="stretch",
-            )
-            st.dataframe(
-                _safe_dataframe(area_top, [c for c in ["area_id", "queue_time_min", "payload_compliance_pct", "reason"] if c in area_top.columns]),
-                width="stretch",
-                hide_index=True,
-            )
+def _plant_name(metadata: pd.DataFrame) -> str:
+    if metadata.empty or "plant_name" not in metadata.columns:
+        return "Plant"
+    return str(metadata["plant_name"].iloc[0])
 
 
-def render_excavators(results: Dict[str, Any], targets: pd.DataFrame, filters: FilterState) -> None:
-    st.markdown("### Excavator Productivity")
-    exc_kpi = results["exc_kpi"]
-
-    if exc_kpi.empty:
-        st.info("No excavator records available for selected filters.")
-        return
-
-    trend_df = (
-        exc_kpi.groupby("date", as_index=False)["tonnes_per_operating_hour"].mean()
-        if {"date", "tonnes_per_operating_hour"}.issubset(exc_kpi.columns)
-        else pd.DataFrame(columns=["date", "tonnes_per_operating_hour"])
-    )
-
-    target = resolve_target(
-        targets,
-        filters.site_id,
-        "excavator",
-        "tonnes_per_operating_hour",
-        filters.area_ids,
-        filters.date_to,
-    )
-
-    st.plotly_chart(
-        trend_with_target(
-            trend_df,
-            value_col="tonnes_per_operating_hour",
-            title="Excavator TPH Trend vs Target",
-            y_title="Tonnes/Operating Hour",
-            target=target,
-        ),
-        width="stretch",
-    )
-
-    rank_table = summarize_unit_ranking(exc_kpi, "excavator")
-    table_cols = [
-        c
-        for c in [
-            "equipment_id",
-            "tonnes_per_operating_hour",
-            "availability_pct",
-            "utilization_pct",
-            "down_h",
-            "cycles_per_hour",
-            "avg_cycle_time_s",
-            "bucket_fill_factor",
-        ]
-        if c in rank_table.columns
-    ]
-
-    left, right = st.columns([1.2, 1.0])
-
-    with left:
-        st.markdown("**Ranking Table (Worst to Best)**")
-        st.dataframe(_safe_dataframe(rank_table, table_cols), width="stretch", hide_index=True)
-
-    with right:
-        st.markdown("**TPH vs Availability**")
-        st.plotly_chart(productivity_scatter(exc_kpi, "Excavator Scatter"), width="stretch")
-
-    units = sorted(exc_kpi["equipment_id"].dropna().astype(str).unique().tolist()) if "equipment_id" in exc_kpi.columns else []
-    if units:
-        selected_unit = st.selectbox("Per-unit timeline", options=units, index=0, key="exc_unit")
-        st.plotly_chart(
-            unit_timeline(exc_kpi, selected_unit, f"Excavator {selected_unit} - TPH and Downtime Composition"),
-            width="stretch",
-        )
+def _last_refresh(metadata: pd.DataFrame) -> str:
+    if metadata.empty or "last_refresh_ts" not in metadata.columns:
+        return "Unknown refresh"
+    value = pd.to_datetime(metadata["last_refresh_ts"].iloc[0], errors="coerce")
+    if pd.isna(value):
+        return "Unknown refresh"
+    return value.strftime("%d %b %Y %H:%M")
 
 
-def render_trucks(results: Dict[str, Any], targets: pd.DataFrame, filters: FilterState) -> None:
-    st.markdown("### Truck Productivity")
-    trk_kpi = results["trk_kpi"]
-
-    if trk_kpi.empty:
-        st.info("No truck records available for selected filters.")
-        return
-
-    trend_df = (
-        trk_kpi.groupby("date", as_index=False)["tonnes_per_operating_hour"].mean()
-        if {"date", "tonnes_per_operating_hour"}.issubset(trk_kpi.columns)
-        else pd.DataFrame(columns=["date", "tonnes_per_operating_hour"])
-    )
-
-    target = resolve_target(
-        targets,
-        filters.site_id,
-        "truck",
-        "tonnes_per_operating_hour",
-        filters.area_ids,
-        filters.date_to,
-    )
-
-    st.plotly_chart(
-        trend_with_target(
-            trend_df,
-            value_col="tonnes_per_operating_hour",
-            title="Truck TPH Trend vs Target",
-            y_title="Tonnes/Operating Hour",
-            target=target,
-        ),
-        width="stretch",
-    )
-
-    col_1, col_2 = st.columns([1.2, 1.0])
-
-    rank_table = summarize_unit_ranking(trk_kpi, "truck")
-    table_cols = [
-        c
-        for c in [
-            "equipment_id",
-            "tonnes_per_operating_hour",
-            "availability_pct",
-            "utilization_pct",
-            "avg_payload_t",
-            "payload_compliance_pct",
-            "cycle_time_min",
-            "queue_time_min",
-        ]
-        if c in rank_table.columns
-    ]
-
-    with col_1:
-        st.markdown("**Worst Trucks (Ranking)**")
-        st.dataframe(_safe_dataframe(rank_table, table_cols), width="stretch", hide_index=True)
-
-    with col_2:
-        st.markdown("**Payload Distribution**")
-        st.plotly_chart(payload_distribution(trk_kpi, "Truck Payload Distribution"), width="stretch")
-
-    st.markdown("**TPH vs Availability**")
-    st.plotly_chart(productivity_scatter(trk_kpi, "Truck Scatter"), width="stretch")
-
-    units = sorted(trk_kpi["equipment_id"].dropna().astype(str).unique().tolist()) if "equipment_id" in trk_kpi.columns else []
-    if units:
-        selected_unit = st.selectbox("Per-unit timeline", options=units, index=0, key="trk_unit")
-        st.plotly_chart(
-            unit_timeline(trk_kpi, selected_unit, f"Truck {selected_unit} - TPH and Downtime Composition"),
-            width="stretch",
-        )
-
-    route_rank = results.get("route_rank", pd.DataFrame())
-    if not route_rank.empty:
-        st.markdown("**Route Ranking (Optional Sheet)**")
-        st.dataframe(route_rank.head(15), width="stretch", hide_index=True)
+def _date_bounds(site_data: Dict[str, pd.DataFrame]) -> Tuple[Optional[date], Optional[date]]:
+    dates: List[date] = []
+    for key in ["daily_mine", "daily_plant", "daily_fleet"]:
+        df = site_data.get(key, pd.DataFrame())
+        if not df.empty and "date" in df.columns:
+            dates.extend(pd.to_datetime(df["date"], errors="coerce").dt.date.dropna().tolist())
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
 
 
-def render_data_quality(workbook: WorkbookData) -> None:
-    st.markdown("### Data Quality & Validation")
+def _health_chip_class(health_summary: pd.DataFrame) -> str:
+    if health_summary.empty:
+        return "health-chip-warn"
+    status = str(health_summary.iloc[0].get("status", "")).lower()
+    if "healthy" in status:
+        return "health-chip-good"
+    if "warning" in status or "usable" in status:
+        return "health-chip-warn"
+    return "health-chip-bad"
+
+
+def _render_status_messages(workbook: WorkbookData) -> None:
+    for error in workbook.errors:
+        st.error(error)
+    for warning in workbook.warnings:
+        st.warning(warning)
+
+
+def _apply_range_preset(label: str, min_date: date, max_date: date) -> None:
+    if label == "Latest":
+        st.session_state["selected_range"] = (max_date, max_date)
+        st.rerun()
+    if label == "7D":
+        start = max(min_date, max_date - pd.Timedelta(days=6).to_pytimedelta())
+        st.session_state["selected_range"] = (start, max_date)
+        st.rerun()
+    if label == "30D":
+        start = max(min_date, max_date - pd.Timedelta(days=29).to_pytimedelta())
+        st.session_state["selected_range"] = (start, max_date)
+        st.rerun()
+    if label == "Full":
+        st.session_state["selected_range"] = (min_date, max_date)
+        st.rerun()
+
+
+def _render_snapshot_card(card: Dict[str, Any], period_days: int) -> None:
+    delta = card.get("delta", float("nan"))
+    delta_color = _delta_color(card["metric"], delta)
+    sparkline = card.get("sparkline", pd.DataFrame())
+    show_sparkline = not sparkline.empty and len(sparkline) >= 2
+    st.markdown("<div class='metric-shell'>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-title'>{card['label']}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='metric-value'>{_format_metric(card['metric'], card.get('actual', float('nan')))}</div>", unsafe_allow_html=True)
     st.markdown(
-        "Friendly warnings are shown below; KPI calculations degrade gracefully and display N/A when required columns are missing."
+        f"<div class='metric-delta' style='color:{delta_color}'>{_format_delta(card['metric'], delta)} vs previous {period_days}-day period</div>",
+        unsafe_allow_html=True,
+    )
+    if card.get("status") == "N/A" and card.get("reason"):
+        st.markdown(f"<div class='metric-note'>{card['reason']}</div>", unsafe_allow_html=True)
+    else:
+        st.markdown(f"<div class='metric-note'>Trend: {card.get('trend_label', 'N/A')}</div>", unsafe_allow_html=True)
+    if show_sparkline:
+        st.plotly_chart(
+            sparkline_figure(sparkline, card["metric"], color=METRIC_COLORS.get(card["metric"], TOKENS["accent"])),
+            width="stretch",
+            config={"displayModeBar": False},
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_snapshot(
+    overview: Dict[str, Any],
+    site_name: str,
+    plant_name: str,
+    workbook: WorkbookData,
+    date_from: date,
+    date_to: date,
+    min_date: date,
+    max_date: date,
+) -> None:
+    metadata = workbook.sheets.get("metadata", pd.DataFrame())
+    quality_summary = workbook.quality.get("health_summary", pd.DataFrame())
+    health_class = _health_chip_class(quality_summary)
+    latest_available = workbook.quality.get("last_available", pd.DataFrame())
+    latest_label = "Unknown"
+    if not latest_available.empty and "last_available_date" in latest_available.columns:
+        latest_dt = pd.to_datetime(latest_available["last_available_date"], errors="coerce").max()
+        if pd.notna(latest_dt):
+            latest_label = latest_dt.strftime("%d %b %Y")
+
+    source_label = "Uploaded workbook" if workbook.source_name == "uploaded_workbook.xlsx" else Path(workbook.source_name).name or "Workbook"
+    health_status = "Unknown"
+    if not quality_summary.empty:
+        health_status = str(quality_summary.iloc[0].get("status", "Unknown"))
+
+    st.markdown("<div class='hero-shell'>", unsafe_allow_html=True)
+    title_col, utility_col = st.columns([1.7, 1.0])
+    with title_col:
+        st.markdown("<div class='hero-title'>Mining Operations Executive Dashboard</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='hero-subtitle'>A calm, daily operating view across mine, plant, fleet, and data quality for executive review.</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("<div class='chip-row'>", unsafe_allow_html=True)
+        st.markdown(f"<span class='chip'>Site: {site_name}</span>", unsafe_allow_html=True)
+        st.markdown(f"<span class='chip'>Plant: {plant_name}</span>", unsafe_allow_html=True)
+        st.markdown(f"<span class='chip'>Latest available: {latest_label}</span>", unsafe_allow_html=True)
+        st.markdown(f"<span class='chip {health_class}'>Data quality: {health_status}</span>", unsafe_allow_html=True)
+        st.markdown(f"<span class='chip'>Source: {source_label}</span>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+    with utility_col:
+        uploaded = st.file_uploader("Replace workbook", type=["xlsx"], key="hero_upload")
+        if uploaded is not None:
+            st.session_state["uploaded_workbook_bytes"] = uploaded.getvalue()
+            st.rerun()
+        if TEMPLATE_PATH.exists():
+            st.download_button(
+                "Download official template",
+                data=cached_template_bytes(str(TEMPLATE_PATH)),
+                file_name=TEMPLATE_PATH.name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch",
+            )
+        st.caption(f"Last import refresh: {_last_refresh(metadata)}")
+        st.caption("Use the official template to keep imports compatible and validation calm.")
+
+    if date_from is not None and date_to is not None:
+        left, right = st.columns([1.35, 1.0])
+        with left:
+            preset_cols = st.columns(4)
+            preset_labels = ["Latest", "7D", "30D", "Full"]
+            for idx, label in enumerate(preset_labels):
+                if preset_cols[idx].button(label, key=f"preset_{label}", use_container_width=True):
+                    _apply_range_preset(label, min_date, max_date)
+            selected = st.date_input(
+                "Selected date range",
+                value=(date_from, date_to),
+                min_value=min_date,
+                max_value=max_date,
+                key="hero_date_input",
+            )
+            if isinstance(selected, tuple) and len(selected) == 2:
+                current_from, current_to = selected
+            else:
+                current_from, current_to = date_from, date_to
+            st.session_state["selected_range"] = (current_from, current_to)
+        with right:
+            st.markdown(
+                f"<div class='range-banner'><div><div class='range-label'>Selected range</div><div class='range-value'>{_range_text(current_from, current_to)}</div></div><div class='range-days'>{_range_days(current_from, current_to)} days</div></div>",
+                unsafe_allow_html=True,
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='readout-shell'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-kicker'>Executive readout</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='readout-text'>{overview.get('readout', 'No readout available.')}</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='status-shell'>", unsafe_allow_html=True)
+    st.markdown("<div class='section-kicker'>What changed</div>", unsafe_allow_html=True)
+    change_strip = overview.get("change_strip", pd.DataFrame())
+    if change_strip.empty:
+        st.caption("No previous-period deltas are available for the current selection.")
+    else:
+        for row in change_strip.itertuples(index=False):
+            st.markdown(
+                f"<span class='change-pill {_delta_chip_class(row.metric, row.delta)}'>{row.label}: {_format_delta(row.metric, row.delta)}</span>",
+                unsafe_allow_html=True,
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    cards = {card["metric"]: card for card in overview.get("cards", [])}
+    st.markdown("<div class='group-heading'>Mine performance</div>", unsafe_allow_html=True)
+    mine_cols = st.columns(4)
+    for idx, metric in enumerate(MINE_CARD_ORDER):
+        if metric in cards:
+            with mine_cols[idx]:
+                _render_snapshot_card(cards[metric], max(overview.get("period_days", 1), 1))
+
+    st.markdown("<div class='group-heading'>Plant performance</div>", unsafe_allow_html=True)
+    plant_cols = st.columns(4)
+    for idx, metric in enumerate(PLANT_CARD_ORDER):
+        if metric in cards:
+            with plant_cols[idx]:
+                _render_snapshot_card(cards[metric], max(overview.get("period_days", 1), 1))
+
+
+def _render_overview(overview: Dict[str, Any]) -> None:
+    st.markdown("<div class='subtle-lead'>Start here for the operating picture, then move into Mine, Plant, or Fleet for diagnosis.</div>", unsafe_allow_html=True)
+    top_left, top_right = st.columns(2)
+    with top_left:
+        st.plotly_chart(mine_production_combo(overview.get("mine_daily", pd.DataFrame()), "Movement and ore production"), width="stretch")
+    with top_right:
+        st.plotly_chart(plant_performance_combo(overview.get("plant_daily", pd.DataFrame()), "Plant operating rhythm"), width="stretch")
+
+    st.markdown("### Fleet availability")
+    row_one = st.columns(2)
+    row_two = st.columns(2)
+    cols = row_one + row_two
+    availability = overview.get("availability_groups", pd.DataFrame())
+    for idx, group_name in enumerate(AVAILABILITY_GROUP_ORDER):
+        with cols[idx]:
+            st.plotly_chart(group_metric_chart(availability, group_name, "availability_pct", f"{group_name}", "Availability"), width="stretch")
+
+    st.plotly_chart(area_contribution_chart(overview.get("area_contribution", pd.DataFrame()), "Contribution by cut"), width="stretch")
+
+
+def _render_mine(site_data: Dict[str, pd.DataFrame], date_from: date, date_to: date) -> None:
+    st.markdown("<div class='subtle-lead'>Mine focuses on movement, stripping behaviour, diesel draw, and the unit-level story behind them.</div>", unsafe_allow_html=True)
+    fleet_rows = site_data.get("daily_fleet", pd.DataFrame())
+    mine_rows = site_data.get("daily_mine", pd.DataFrame())
+    area_options = sorted(mine_rows.get("area_name", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    filter_group_options = [group for group in MINE_FILTER_GROUP_ORDER if group in fleet_rows.get("mine_filter_group", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()]
+
+    filter_cols = st.columns([1.1, 1.0, 1.6])
+    selected_areas = filter_cols[0].multiselect("Cuts", options=area_options, default=area_options)
+    selected_groups = filter_cols[1].multiselect("Fleet groups", options=filter_group_options, default=filter_group_options)
+
+    equipment_scope = fleet_rows.copy()
+    equipment_scope = equipment_scope[(equipment_scope["date"] >= pd.Timestamp(date_from).date()) & (equipment_scope["date"] <= pd.Timestamp(date_to).date())] if not equipment_scope.empty and "date" in equipment_scope.columns else equipment_scope
+    if selected_areas and "area_name" in equipment_scope.columns:
+        equipment_scope = equipment_scope[equipment_scope["area_name"].isin(selected_areas)]
+    if selected_groups and "mine_filter_group" in equipment_scope.columns:
+        equipment_scope = equipment_scope[equipment_scope["mine_filter_group"].isin(selected_groups)]
+    equipment_options = sorted(equipment_scope.get("equipment_id", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    selected_units = filter_cols[2].multiselect("Equipment", options=equipment_options, default=[])
+
+    mine_page = compute_mine_page(
+        site_data,
+        FilterState(date_from=date_from, date_to=date_to),
+        area_names=selected_areas,
+        equipment_groups=selected_groups,
+        equipment_ids=selected_units,
     )
 
-    quality = workbook.quality
-    sheets = workbook.sheets
+    row_a, row_b = st.columns(2)
+    with row_a:
+        st.plotly_chart(mine_production_combo(mine_page.get("mine_daily", pd.DataFrame()), "BCM moved, ore mined, and ratio"), width="stretch")
+    with row_b:
+        st.plotly_chart(mine_volume_trend(mine_page.get("mine_daily", pd.DataFrame()), "Waste, ore BCM, and tonnes"), width="stretch")
 
-    if workbook.errors:
-        st.markdown("**Validation Errors**")
-        for msg in workbook.errors:
-            st.error(msg)
+    st.plotly_chart(stripping_ratio_trend(mine_page.get("mine_daily", pd.DataFrame()), "Stripping ratio trend"), width="stretch")
 
-    if workbook.warnings:
-        st.markdown("**Warnings**")
-        for msg in workbook.warnings:
-            st.warning(msg)
+    st.markdown("### Fleet utilization")
+    util_row_one = st.columns(2)
+    util_row_two = st.columns(2)
+    util_cols = util_row_one + util_row_two
+    utilization_daily = mine_page.get("utilization_daily", pd.DataFrame())
+    for idx, group_name in enumerate(AVAILABILITY_GROUP_ORDER):
+        with util_cols[idx]:
+            st.plotly_chart(group_metric_chart(utilization_daily, group_name, "utilization_pct", group_name, "Utilization"), width="stretch")
 
-    last_available = quality.get("last_available", pd.DataFrame())
-    missing_shifts = quality.get("missing_shifts", pd.DataFrame())
-    null_pct = quality.get("null_pct", pd.DataFrame())
-    duplicates = quality.get("duplicates", pd.DataFrame())
-    anomalies = quality.get("anomalies", pd.DataFrame())
-    coverage = quality.get("coverage", pd.DataFrame())
+    diesel_left, diesel_right = st.columns(2)
+    with diesel_left:
+        st.plotly_chart(diesel_stacked_chart(mine_page.get("diesel_groups", pd.DataFrame()), "Daily diesel by fleet group"), width="stretch")
+    with diesel_right:
+        st.plotly_chart(rank_bar(mine_page.get("top_diesel", pd.DataFrame()), "equipment_id", "diesel_l", "Highest diesel units", color=TOKENS["diesel"]), width="stretch")
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**Last Available Date by Site**")
+    st.plotly_chart(rank_bar(mine_page.get("bottom_diesel", pd.DataFrame()), "equipment_id", "diesel_l", "Lowest diesel units", color=TOKENS["plant"]), width="stretch")
+
+    ranking = mine_page.get("unit_ranking", pd.DataFrame())
+    ranking_cols = [
+        "equipment_id",
+        "equipment_class",
+        "equipment_subtype",
+        "model",
+        "area_name",
+        "availability_pct",
+        "utilization_pct",
+        "diesel_l",
+        "days_reported",
+    ]
+    st.markdown("### Unit ranking")
+    st.dataframe(_safe_dataframe(ranking, ranking_cols), width="stretch", hide_index=True)
+
+    unit_ids = ranking.get("equipment_id", pd.Series(dtype=str)).dropna().astype(str).tolist()
+    if not unit_ids:
+        st.info("No unit-level fleet records are available for the current Mine filters.")
+        return
+
+    detail_cols = st.columns([1.2, 1.0])
+    selected_unit = detail_cols[0].selectbox("Per-unit timeline", options=unit_ids, index=0)
+    heat_metric = detail_cols[1].selectbox(
+        "Heatmap metric",
+        options=["availability_pct", "utilization_pct"],
+        format_func=lambda metric: METRIC_META[metric]["label"],
+    )
+    timeline = build_unit_timeline(mine_page.get("filtered_units", pd.DataFrame()), selected_unit)
+    heatmap_df = build_unit_heatmap_data(mine_page.get("filtered_units", pd.DataFrame()), heat_metric)
+
+    timeline_col, heatmap_col = st.columns([1.2, 1.0])
+    with timeline_col:
+        st.plotly_chart(unit_timeline_chart(timeline, f"{selected_unit} operating profile"), width="stretch")
+    with heatmap_col:
+        st.plotly_chart(unit_heatmap(heatmap_df, heat_metric, f"Lowest performers by {METRIC_META[heat_metric]['label'].lower()}"), width="stretch")
+
+
+def _render_plant(site_data: Dict[str, pd.DataFrame], date_from: date, date_to: date) -> None:
+    st.markdown("<div class='subtle-lead'>Plant keeps feed, recovery, metal output, and downtime together so the process story stays coherent.</div>", unsafe_allow_html=True)
+    plant_page = compute_plant_page(site_data, FilterState(date_from=date_from, date_to=date_to))
+    plant_daily = plant_page.get("plant_daily", pd.DataFrame())
+
+    first_row, second_row = st.columns(2), st.columns(2)
+    with first_row[0]:
+        st.plotly_chart(plant_feed_throughput_combo(plant_daily, "Feed tonnes and throughput"), width="stretch")
+    with first_row[1]:
+        st.plotly_chart(grade_recovery_scatter(plant_page.get("plant_rows", pd.DataFrame()), "Feed grade versus recovery"), width="stretch")
+    with second_row[0]:
+        st.plotly_chart(metal_production_trend(plant_daily, "Metal produced and recovery"), width="stretch")
+    with second_row[1]:
+        st.plotly_chart(downtime_availability_combo(plant_daily, "Downtime and availability"), width="stretch")
+
+    st.markdown("### Daily operating table")
+    st.dataframe(
+        _safe_dataframe(
+            plant_page.get("daily_table", pd.DataFrame()),
+            ["date", "feed_tonnes", "feed_grade_pct", "throughput_tph", "recovery_pct", "metal_produced_t", "availability_pct", "unplanned_downtime_h"],
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def _render_fleet(site_data: Dict[str, pd.DataFrame], date_from: date, date_to: date) -> None:
+    st.markdown("<div class='subtle-lead'>Fleet separates availability from diesel and unit ranking so shortfalls are easier to isolate.</div>", unsafe_allow_html=True)
+    fleet_page = compute_fleet_page(site_data, FilterState(date_from=date_from, date_to=date_to))
+    availability = fleet_page.get("availability_daily", pd.DataFrame())
+
+    st.markdown("### Fleet availability")
+    fleet_row_one = st.columns(2)
+    fleet_row_two = st.columns(2)
+    fleet_cols = fleet_row_one + fleet_row_two
+    for idx, group_name in enumerate(AVAILABILITY_GROUP_ORDER):
+        with fleet_cols[idx]:
+            st.plotly_chart(group_metric_chart(availability, group_name, "availability_pct", group_name, "Availability"), width="stretch")
+
+    mid_left, mid_right = st.columns(2)
+    with mid_left:
+        st.plotly_chart(diesel_stacked_chart(fleet_page.get("diesel_groups", pd.DataFrame()), "Diesel mix by fleet grouping"), width="stretch")
+    with mid_right:
+        ranking = fleet_page.get("unit_ranking", pd.DataFrame())
+        st.plotly_chart(rank_bar(ranking.sort_values("availability_pct", ascending=True).head(10), "equipment_id", "availability_pct", "Lowest availability units", color=TOKENS["bad"]), width="stretch")
+
+    ranking = fleet_page.get("unit_ranking", pd.DataFrame())
+    st.markdown("### Fleet unit list")
+    st.dataframe(
+        _safe_dataframe(ranking, ["equipment_id", "equipment_class", "equipment_subtype", "model", "area_name", "availability_pct", "utilization_pct", "diesel_l", "days_reported"]),
+        width="stretch",
+        hide_index=True,
+    )
+
+    unit_ids = ranking.get("equipment_id", pd.Series(dtype=str)).dropna().astype(str).tolist()
+    if not unit_ids:
+        st.info("No fleet records are available for the selected period.")
+        return
+
+    detail_cols = st.columns([1.2, 1.0])
+    selected_unit = detail_cols[0].selectbox("Fleet unit detail", options=unit_ids, index=0, key="fleet_unit_select")
+    heat_metric = detail_cols[1].selectbox(
+        "Fleet heatmap metric",
+        options=["availability_pct", "utilization_pct"],
+        format_func=lambda metric: METRIC_META[metric]["label"],
+        key="fleet_heat_metric",
+    )
+    timeline = build_unit_timeline(fleet_page.get("fleet_rows", pd.DataFrame()), selected_unit)
+    heatmap_df = build_unit_heatmap_data(fleet_page.get("fleet_rows", pd.DataFrame()), heat_metric)
+
+    detail_left, detail_right = st.columns([1.2, 1.0])
+    with detail_left:
+        st.plotly_chart(unit_timeline_chart(timeline, f"{selected_unit} trend"), width="stretch")
+    with detail_right:
+        st.plotly_chart(unit_heatmap(heatmap_df, heat_metric, f"Fleet heatmap: {METRIC_META[heat_metric]['label'].lower()}"), width="stretch")
+
+
+def _render_data_quality(workbook: WorkbookData) -> None:
+    st.markdown("<div class='subtle-lead'>Data Quality shows whether the workbook is decision-grade, where it is thin, and what should be fixed next.</div>", unsafe_allow_html=True)
+    health_summary = workbook.quality.get("health_summary", pd.DataFrame())
+    issues = workbook.quality.get("issues", pd.DataFrame())
+    duplicates = workbook.quality.get("duplicates", pd.DataFrame())
+    null_pct = workbook.quality.get("null_pct", pd.DataFrame())
+    last_available = workbook.quality.get("last_available", pd.DataFrame())
+    missing_dates_area = workbook.quality.get("missing_dates_area", pd.DataFrame())
+    missing_dates_fleet = workbook.quality.get("missing_dates_fleet", pd.DataFrame())
+    coverage_area = workbook.quality.get("coverage_area", pd.DataFrame())
+    coverage_fleet = workbook.quality.get("coverage_fleet", pd.DataFrame())
+
+    st.markdown("### Data quality health")
+    top_cols = st.columns([0.9, 1.1])
+    with top_cols[0]:
+        st.dataframe(health_summary, width="stretch", hide_index=True)
+    with top_cols[1]:
+        st.plotly_chart(issue_severity_chart(issues, "Issue severity"), width="stretch")
+
+    st.markdown("### Issue log")
+    if issues.empty:
+        st.success("No data quality issues were recorded for this workbook.")
+    else:
+        st.dataframe(issues, width="stretch", hide_index=True)
+
+    info_left, info_right = st.columns(2)
+    with info_left:
+        st.markdown("**Last available dates**")
         st.dataframe(last_available, width="stretch", hide_index=True)
+        st.markdown("**Duplicate checks**")
+        st.dataframe(duplicates, width="stretch", hide_index=True)
+    with info_right:
+        st.markdown("**Missing dates by cut**")
+        st.dataframe(missing_dates_area, width="stretch", hide_index=True)
+        st.markdown("**Missing dates by equipment**")
+        st.dataframe(missing_dates_fleet.head(25), width="stretch", hide_index=True)
 
-    with col_b:
-        st.markdown("**Missing Shifts by Site/Area**")
-        st.dataframe(missing_shifts, width="stretch", hide_index=True)
+    cov_left, cov_right = st.columns(2)
+    with cov_left:
+        st.plotly_chart(coverage_heatmap(coverage_area, "area_name", "records", "Coverage by cut"), width="stretch")
+    with cov_right:
+        st.plotly_chart(coverage_heatmap(coverage_fleet.head(300), "equipment_id", "records", "Coverage by equipment"), width="stretch")
 
-    st.markdown("**Critical Null % (Required Columns)**")
+    st.markdown("### Critical null percentages")
     st.dataframe(null_pct, width="stretch", hide_index=True)
 
-    col_c, col_d = st.columns(2)
-    with col_c:
-        st.markdown("**Duplicate Key Checks**")
-        st.dataframe(duplicates, width="stretch", hide_index=True)
-    with col_d:
-        st.markdown("**Anomaly Checks**")
-        st.dataframe(anomalies, width="stretch", hide_index=True)
+    st.markdown("### KPI traceability")
+    st.dataframe(build_kpi_availability_report(workbook.sheets), width="stretch", hide_index=True)
 
-    st.markdown("**Coverage Heatmap (Days vs Shifts)**")
-    cov_col1, cov_col2 = st.columns(2)
-    with cov_col1:
-        st.plotly_chart(
-            coverage_heatmap(coverage, "excavator", "Excavator Coverage"),
-            width="stretch",
-        )
-    with cov_col2:
-        st.plotly_chart(
-            coverage_heatmap(coverage, "truck", "Truck Coverage"),
-            width="stretch",
-        )
-
-    st.markdown("**KPI Availability and N/A Reasons**")
-    st.dataframe(build_kpi_availability_report(sheets), width="stretch", hide_index=True)
+    with st.expander("Schema overview", expanded=False):
+        st.dataframe(cached_schema_overview(), width="stretch", hide_index=True)
+        st.dataframe(cached_field_guide(), width="stretch", hide_index=True)
 
 
 def main() -> None:
-    st.title("Mining Dispatch Productivity Dashboard")
-    st.caption("Focus: Excavators/Shovels and Trucks only. Costs and other domains are intentionally excluded.")
+    base_workbook = _default_workbook()
+    uploaded_bytes = st.session_state.get("uploaded_workbook_bytes")
+    workbook = cached_load_from_bytes(uploaded_bytes) if uploaded_bytes else base_workbook
+    _render_status_messages(workbook)
 
-    workbook = _build_source_section()
-    _render_messages(workbook)
-
-    sheets = workbook.sheets
-    if not sheets:
+    if not workbook.sheets:
         st.stop()
 
-    filters = _build_global_filters(sheets)
+    site_data = prepare_site_data(workbook.sheets)
+    metadata = site_data.get("metadata", pd.DataFrame())
+    site_name = _site_name(metadata)
+    plant_name = _plant_name(metadata)
+    min_date, max_date = _date_bounds(site_data)
+    if min_date is None or max_date is None:
+        st.error("The workbook does not contain any valid operational dates.")
+        st.stop()
 
-    filtered = filter_all_facts(sheets, filters)
-    targets = sheets.get("targets", pd.DataFrame())
-
-    results = cached_compute(
-        filtered_exc=filtered.get("fact_shift_excavator", pd.DataFrame()),
-        filtered_trk=filtered.get("fact_shift_truck", pd.DataFrame()),
-        filtered_route=filtered.get("fact_shift_truck_route", pd.DataFrame()),
-        targets=targets,
-        site_id=filters.site_id,
-        date_from=filters.date_from,
-        date_to=filters.date_to,
-        shift=filters.shift,
-        area_ids=filters.area_ids or [],
-        equipment_ids=filters.equipment_ids or [],
+    default_range = st.session_state.get("selected_range", (max_date, max_date))
+    if not isinstance(default_range, tuple) or len(default_range) != 2:
+        default_range = (max_date, max_date)
+    default_range = (
+        max(min_date, min(default_range[0], max_date)),
+        max(min_date, min(default_range[1], max_date)),
     )
+    overview_preview = compute_overview(site_data, FilterState(date_from=default_range[0], date_to=default_range[1]), workbook.quality.get("health_summary", pd.DataFrame()))
+    _render_snapshot(overview_preview, site_name, plant_name, workbook, default_range[0], default_range[1], min_date, max_date)
 
-    tabs = st.tabs(["Overview", "Excavators", "Trucks", "Data Quality"])
+    selected_range = st.session_state.get("selected_range", default_range)
+    date_from, date_to = selected_range
+    overview = compute_overview(site_data, FilterState(date_from=date_from, date_to=date_to), workbook.quality.get("health_summary", pd.DataFrame()))
 
+    tabs = st.tabs(["Overview", "Mine", "Plant", "Fleet", "Data Quality"])
     with tabs[0]:
-        render_overview(results, targets, filters)
+        _render_overview(overview)
     with tabs[1]:
-        render_excavators(results, targets, filters)
+        _render_mine(site_data, date_from, date_to)
     with tabs[2]:
-        render_trucks(results, targets, filters)
+        _render_plant(site_data, date_from, date_to)
     with tabs[3]:
-        render_data_quality(workbook)
+        _render_fleet(site_data, date_from, date_to)
+    with tabs[4]:
+        _render_data_quality(workbook)
 
 
 if __name__ == "__main__":
