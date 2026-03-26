@@ -39,7 +39,12 @@ The hero area at the top of the app contains:
 
 ## Repository Structure
 - `/Users/kirill/Desktop/mining dashboard/app.py`
+- `/Users/kirill/Desktop/mining dashboard/streamlit_app.py`
 - `/Users/kirill/Desktop/mining dashboard/main.py`
+- `/Users/kirill/Desktop/mining dashboard/public/app.js`
+- `/Users/kirill/Desktop/mining dashboard/public/styles.css`
+- `/Users/kirill/Desktop/mining dashboard/templates/index.html`
+- `/Users/kirill/Desktop/mining dashboard/src/dashboard_api.py`
 - `/Users/kirill/Desktop/mining dashboard/pyproject.toml`
 - `/Users/kirill/Desktop/mining dashboard/src/io_excel.py`
 - `/Users/kirill/Desktop/mining dashboard/src/kpi.py`
@@ -52,32 +57,59 @@ The hero area at the top of the app contains:
 - `/Users/kirill/Desktop/mining dashboard/data/mine_productivity_input.xlsx`
 
 ## Run Locally
+Vercel-compatible app:
 ```bash
 cd "/Users/kirill/Desktop/mining dashboard"
-/tmp/miniforge3/bin/pip install -r requirements.txt
-/tmp/miniforge3/bin/python scripts/make_template.py
-/tmp/miniforge3/bin/streamlit run app.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python scripts/make_template.py
+.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8514
 ```
 
-Open [http://localhost:8501](http://localhost:8501).
+Open [http://127.0.0.1:8514](http://127.0.0.1:8514).
 
-## Deployment Entrypoints
-Direct Python entrypoint:
+Optional legacy Streamlit shell:
 ```bash
 cd "/Users/kirill/Desktop/mining dashboard"
-/tmp/miniforge3/bin/python main.py
+.venv/bin/python main.py
+```
+
+Open [http://127.0.0.1:8501](http://127.0.0.1:8501).
+
+## Deployment Entrypoints
+Vercel serves the FastAPI application from `/Users/kirill/Desktop/mining dashboard/app.py`.
+The browser UI is the HTML shell in `/Users/kirill/Desktop/mining dashboard/templates/index.html` with frontend assets in `/Users/kirill/Desktop/mining dashboard/public/`.
+
+Primary API routes:
+- `GET /api/dashboard` loads the default workbook in `data/mine_productivity_input.xlsx`
+- `POST /api/dashboard` analyzes an uploaded workbook sent as raw request bytes
+- `GET /api/template` downloads the canonical template
+- `GET /api/sample` downloads the sample workbook
+
+Legacy local Streamlit entrypoint:
+```bash
+cd "/Users/kirill/Desktop/mining dashboard"
+.venv/bin/python main.py
 ```
 
 Console script after editable install:
 ```bash
 cd "/Users/kirill/Desktop/mining dashboard"
-/tmp/miniforge3/bin/pip install -e .
+.venv/bin/pip install -e .
 app
 ```
 
 `main.py` honors:
 - `PORT` default `8501`
 - `HOST` default `0.0.0.0`
+
+## Deploy To Vercel
+1. Push this repository to GitHub, GitLab, or Bitbucket.
+2. Import the repository into Vercel.
+3. Leave the project as a Python/FastAPI deployment with no custom build command.
+4. Deploy.
+
+The deployed app will serve the browser UI at `/` and the data endpoints from `/api/*`.
 
 ## Canonical Workbook Contract
 This application now uses one canonical source of truth across:
@@ -241,7 +273,7 @@ The `Data Quality` page shows:
 Generate both with:
 ```bash
 cd "/Users/kirill/Desktop/mining dashboard"
-/tmp/miniforge3/bin/python scripts/make_template.py
+.venv/bin/python scripts/make_template.py
 ```
 
 Outputs:

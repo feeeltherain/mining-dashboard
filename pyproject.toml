@@ -7,20 +7,22 @@ name = "mine-productivity-dashboard"
 version = "0.1.0"
 description = "Single-site mine and plant executive dashboard"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
-    "streamlit==1.54.0",
+    "streamlit==1.50.0",
+    "fastapi==0.115.6",
+    "uvicorn==0.32.1",
     "pandas==2.3.3",
     "plotly==6.5.2",
     "openpyxl==3.1.5",
-    "numpy==2.4.2",
+    "numpy==1.26.4",
 ]
 
 [project.scripts]
 app = "main:main"
 
 [tool.setuptools]
-py-modules = ["main", "app"]
+py-modules = ["main", "app", "streamlit_app"]
 
 [tool.setuptools.packages.find]
 where = ["."]

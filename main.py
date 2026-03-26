@@ -7,7 +7,7 @@ from pathlib import Path
 from streamlit.web import cli as stcli
 
 
-APP_PATH = Path(__file__).resolve().parent / "app.py"
+APP_PATH = Path(__file__).resolve().parent / "streamlit_app.py"
 
 
 def main() -> int:
